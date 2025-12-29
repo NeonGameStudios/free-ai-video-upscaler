@@ -41,7 +41,7 @@ let video: HTMLVideoElement;
 let previewBitmap: ImageBitmap | null = null;
 
 // Current settings
-let currentModel: ModelType = 'realesrgan-anime-fast';
+let currentModel: ModelType = 'realesr-animevideov3';
 let currentDenoiseLevel: DenoiseLevel = 0;
 let currentOutputFormat: OutputFormat = 'mp4';
 let currentOutputResolution: OutputResolution = 'auto';

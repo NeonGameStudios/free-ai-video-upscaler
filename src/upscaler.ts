@@ -21,7 +21,7 @@ export interface UpscalerConfig {
 
 // Default configuration
 const DEFAULT_CONFIG: UpscalerConfig = {
-  modelId: 'realesrgan-anime-fast',
+  modelId: 'realesr-animevideov3',
   scale: 4,
   tileSize: 256,
   tilePadding: 16,

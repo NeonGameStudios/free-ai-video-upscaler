@@ -12,6 +12,7 @@ export interface Resolution {
 
 // Available upscaling models
 export type ModelType =
+  | 'realesr-animevideov3'
   | 'realesrgan-anime-fast'
   | 'realesrgan-anime-plus'
   | 'realesrgan-general-fast'
@@ -31,6 +32,14 @@ export interface ModelInfo {
 
 // All available models
 export const AVAILABLE_MODELS: ModelInfo[] = [
+  {
+    id: 'realesr-animevideov3',
+    name: 'RealESR AnimeVideo v3',
+    description: 'Optimized for anime videos (4x) - Recommended',
+    scale: 4,
+    supportsDenoising: false,
+    modelFile: 'realesr-animevideov3.onnx'
+  },
   {
     id: 'realesrgan-anime-fast',
     name: 'Real-ESRGAN Anime Fast',
