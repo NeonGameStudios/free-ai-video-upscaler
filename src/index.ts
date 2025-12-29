@@ -1,7 +1,30 @@
+/**
+ * Free AI Video Upscaler - Main Application
+ *
+ * Browser-based video upscaling using Real-ESRGAN and Real-CUGAN models.
+ * All processing happens locally in the browser using WebGPU acceleration.
+ */
+
 import Alpine from 'alpinejs';
 import ImageCompare from './lib/image-compare-viewer.min';
-import WebSR from '@websr/websr';
-import type { WorkerRequestMessage, WorkerResponseMessage } from './types/worker-messages';
+import {
+  AVAILABLE_MODELS,
+  OUTPUT_FORMATS,
+  RESOLUTION_PRESETS,
+  getModelInfo,
+  getFormatInfo,
+  getResolutionPreset,
+} from './types/worker-messages';
+import type {
+  WorkerRequestMessage,
+  WorkerResponseMessage,
+  ModelType,
+  ModelInfo,
+  DenoiseLevel,
+  OutputFormat,
+  OutputResolution,
+  ModelConfig,
+} from './types/worker-messages';
 
 import 'bootstrap';
 import 'bootstrap/dist/css/bootstrap.min.css';
@@ -15,57 +38,17 @@ const worker = new Worker(new URL('./worker.ts', import.meta.url));
 let upscaled_canvas: HTMLCanvasElement;
 let original_canvas: HTMLCanvasElement;
 let video: HTMLVideoElement;
+let previewBitmap: ImageBitmap | null = null;
 
-// Network selection
-type NetworkSize = 'small' | 'medium' | 'large';
-type ContentType = 'rl' | 'an' | '3d';
-
-let size: NetworkSize = 'medium';
-let content: ContentType = 'rl';
+// Current settings
+let currentModel: ModelType = 'realesr-animevideov3';
+let currentDenoiseLevel: DenoiseLevel = 0;
+let currentOutputFormat: OutputFormat = 'mp4';
+let currentOutputResolution: OutputResolution = 'auto';
 
 // Video data
 let download_name: string;
 let inputFileHandle: FileSystemFileHandle;
-let gpu: any;
-let websr: WebSR;
-
-// AI model weights for different network sizes and content types
-type WeightsMap = {
-    [K in NetworkSize]: {
-        [C in ContentType]: any;
-    };
-};
-
-const weights: WeightsMap = {
-    'large': {
-        'rl': require('./weights/cnn-2x-l-rl.json'),
-        'an': require('./weights/cnn-2x-l-an.json'),
-        '3d': require('./weights/cnn-2x-l-3d.json'),
-    },
-    'medium': {
-        'rl': require('./weights/cnn-2x-m-rl.json'),
-        'an': require('./weights/cnn-2x-m-an.json'),
-        '3d': require('./weights/cnn-2x-m-3d.json'),
-    },
-    'small': {
-        'rl': require('./weights/cnn-2x-s-rl.json'),
-        'an': require('./weights/cnn-2x-s-an.json'),
-        '3d': require('./weights/cnn-2x-s-3d.json'),
-    }
-};
-
-// Network name mapping
-const networks: Record<NetworkSize, { name: string }> = {
-    'small': {
-        name: "anime4k/cnn-2x-s",
-    },
-    'medium': {
-        name: "anime4k/cnn-2x-m",
-    },
-    'large': {
-        name: "anime4k/cnn-2x-l",
-    }
-};
 
 // Declare global window functions for Alpine to call and File System Access API
 declare global {
@@ -73,8 +56,10 @@ declare global {
         chooseFile: (e?: Event) => Promise<void>;
         initRecording: () => Promise<void>;
         fullScreenPreview: (e?: Event) => Promise<void>;
-        switchNetworkSize: (el: HTMLInputElement) => Promise<void>;
-        switchNetworkStyle: (el: HTMLInputElement) => Promise<void>;
+        onModelChange: (modelId: string) => Promise<void>;
+        onDenoiseChange: (level: number) => void;
+        onFormatChange: (format: string) => void;
+        onResolutionChange: (resolution: string) => void;
         showSaveFilePicker: (options?: any) => Promise<FileSystemFileHandle>;
         showOpenFilePicker: (options?: any) => Promise<FileSystemFileHandle[]>;
     }
@@ -85,10 +70,25 @@ document.addEventListener("DOMContentLoaded", index);
 //===================  Initial Load ===========================
 
 /**
- * Main initialization function called on page load
+ * Main initialization function called on page load.
  */
 async function index(): Promise<void> {
     Alpine.store('state', 'init');
+
+    // Initialize settings stores
+    Alpine.store('models', AVAILABLE_MODELS);
+    Alpine.store('formats', OUTPUT_FORMATS);
+    Alpine.store('resolutions', RESOLUTION_PRESETS);
+
+    Alpine.store('selectedModel', currentModel);
+    Alpine.store('selectedDenoise', currentDenoiseLevel);
+    Alpine.store('selectedFormat', currentOutputFormat);
+    Alpine.store('selectedResolution', currentOutputResolution);
+
+    // Get initial model info
+    const modelInfo = getModelInfo(currentModel);
+    Alpine.store('currentScale', modelInfo?.scale || 4);
+    Alpine.store('supportsDenoising', modelInfo?.supportsDenoising || false);
 
     Alpine.start();
     document.body.style.display = "block";
@@ -102,11 +102,16 @@ async function index(): Promise<void> {
 
     worker.postMessage({ cmd: 'isSupported' } satisfies WorkerRequestMessage);
 
+    // Set up global functions
     window.chooseFile = chooseFile;
+    window.onModelChange = onModelChange;
+    window.onDenoiseChange = onDenoiseChange;
+    window.onFormatChange = onFormatChange;
+    window.onResolutionChange = onResolutionChange;
 }
 
 /**
- * Show unsupported browser feature message
+ * Show unsupported browser feature message.
  */
 function showUnsupported(text: string): void {
     Alpine.store('component', text);
@@ -114,7 +119,7 @@ function showUnsupported(text: string): void {
 }
 
 /**
- * Prompt user to choose a video file using File System Access API
+ * Prompt user to choose a video file using File System Access API.
  */
 async function chooseFile(e?: Event): Promise<void> {
     try {
@@ -133,13 +138,134 @@ async function chooseFile(e?: Event): Promise<void> {
     }
 }
 
+//===================  Settings Handlers ===========================
+
+/**
+ * Handle model selection change.
+ */
+async function onModelChange(modelId: string): Promise<void> {
+    const modelInfo = getModelInfo(modelId as ModelType);
+    if (!modelInfo) return;
+
+    currentModel = modelId as ModelType;
+    Alpine.store('selectedModel', currentModel);
+    Alpine.store('currentScale', modelInfo.scale);
+    Alpine.store('supportsDenoising', modelInfo.supportsDenoising);
+
+    // Reset denoise level if model doesn't support it
+    if (!modelInfo.supportsDenoising) {
+        currentDenoiseLevel = 0;
+        Alpine.store('selectedDenoise', 0);
+    }
+
+    // Update output dimensions display
+    if (video) {
+        updateOutputDimensions();
+    }
+
+    // If we have a preview, switch the model
+    if (previewBitmap && Alpine.store('state') === 'preview') {
+        Alpine.store('state', 'loading');
+        Alpine.store('loading_message', 'Switching model...');
+
+        const modelConfig = getModelConfig();
+
+        worker.postMessage({
+            cmd: 'switchModel',
+            data: {
+                bitmap: previewBitmap,
+                modelConfig
+            }
+        } satisfies WorkerRequestMessage);
+    }
+}
+
+/**
+ * Handle denoise level change.
+ */
+function onDenoiseChange(level: number): void {
+    currentDenoiseLevel = level as DenoiseLevel;
+    Alpine.store('selectedDenoise', currentDenoiseLevel);
+}
+
+/**
+ * Handle output format change.
+ */
+function onFormatChange(format: string): void {
+    currentOutputFormat = format as OutputFormat;
+    Alpine.store('selectedFormat', currentOutputFormat);
+    updateDownloadName();
+}
+
+/**
+ * Handle output resolution change.
+ */
+function onResolutionChange(resolution: string): void {
+    currentOutputResolution = resolution as OutputResolution;
+    Alpine.store('selectedResolution', currentOutputResolution);
+    updateOutputDimensions();
+}
+
+/**
+ * Get current model configuration.
+ */
+function getModelConfig(): ModelConfig {
+    const modelInfo = getModelInfo(currentModel);
+    return {
+        modelId: currentModel,
+        scale: modelInfo?.scale || 4,
+        tileSize: 256,
+        tilePadding: 16,
+        denoiseLevel: modelInfo?.supportsDenoising ? currentDenoiseLevel : undefined,
+    };
+}
+
+/**
+ * Update output dimensions display based on current settings.
+ */
+function updateOutputDimensions(): void {
+    if (!video) return;
+
+    const modelInfo = getModelInfo(currentModel);
+    const scale = modelInfo?.scale || 4;
+    const resPreset = getResolutionPreset(currentOutputResolution);
+
+    let outputWidth = video.videoWidth * scale;
+    let outputHeight = video.videoHeight * scale;
+
+    // Apply resolution limit if not auto
+    if (resPreset && resPreset.maxHeight !== null && outputHeight > resPreset.maxHeight) {
+        const aspectRatio = outputWidth / outputHeight;
+        outputHeight = resPreset.maxHeight;
+        outputWidth = Math.round(outputHeight * aspectRatio);
+    }
+
+    Alpine.store('outputWidth', outputWidth);
+    Alpine.store('outputHeight', outputHeight);
+}
+
+/**
+ * Update download filename based on current settings.
+ */
+function updateDownloadName(): void {
+    if (!video) return;
+
+    const formatInfo = getFormatInfo(currentOutputFormat);
+    const modelInfo = getModelInfo(currentModel);
+    const baseName = (Alpine.store('filename') as string)?.split(".")[0] || 'video';
+
+    download_name = `${baseName}-upscaled-${modelInfo?.scale || 4}x${formatInfo?.extension || '.mp4'}`;
+    Alpine.store('download_name', download_name);
+}
+
 //===================  Preview ===========================
 
 /**
- * Load video file from FileSystemFileHandle
+ * Load video file from FileSystemFileHandle.
  */
 async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     Alpine.store('state', 'loading');
+    Alpine.store('loading_message', 'Loading video...');
 
     // Store the file handle for later processing
     inputFileHandle = fileHandle;
@@ -147,10 +273,9 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     // Get the file to create a preview
     const file = await fileHandle.getFile();
 
-    // Set up download name
-    download_name = file.name.split(".")[0] + "-upscaled.mp4";
-    Alpine.store('download_name', download_name);
+    // Set up initial filename
     Alpine.store('filename', file.name);
+    updateDownloadName();
 
     // Read file for preview setup
     const arrayBuffer = await file.arrayBuffer();
@@ -158,7 +283,7 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
 }
 
 /**
- * Set up the preview UI with before/after comparison
+ * Set up the preview UI with before/after comparison.
  */
 async function setupPreview(data: ArrayBuffer): Promise<void> {
     video = document.createElement('video');
@@ -169,105 +294,92 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
 
     const imageCompare = document.getElementById('image-compare-outer') as HTMLElement;
 
-
-
-    video.onloadeddata = async function (){
-
-
-
+    video.onloadeddata = async function () {
         Alpine.store('width', video.videoWidth);
         Alpine.store('height', video.videoHeight);
-        upscaled_canvas.width = video.videoWidth*2;
-        upscaled_canvas.height = video.videoHeight*2;
-        original_canvas.width = video.videoWidth*2;
-        original_canvas.height = video.videoHeight*2;
 
+        // Update output dimensions
+        updateOutputDimensions();
+
+        const modelInfo = getModelInfo(currentModel);
+        const scale = modelInfo?.scale || 4;
+
+        // Set canvas dimensions
+        upscaled_canvas.width = video.videoWidth * scale;
+        upscaled_canvas.height = video.videoHeight * scale;
+        original_canvas.width = video.videoWidth * scale;
+        original_canvas.height = video.videoHeight * scale;
 
         imageCompare.style.height = '318px';
-        imageCompare.style.width =  `${Math.round(video.videoWidth/video.videoHeight*318)}px`
+        imageCompare.style.width = `${Math.round(video.videoWidth / video.videoHeight * 318)}px`;
         imageCompare.style.margin = 'auto';
         imageCompare.style.position = 'relative';
 
-
         new ImageCompare(document.getElementById('image-compare')).mount();
         video.currentTime = video.duration * 0.2 || 0;
-        if(video.requestVideoFrameCallback)  video.requestVideoFrameCallback(showPreview);
-        else requestAnimationFrame(showPreview);
 
-    }
+        if (video.requestVideoFrameCallback) {
+            video.requestVideoFrameCallback(showPreview);
+        } else {
+            requestAnimationFrame(showPreview);
+        }
+    };
 
-
-
-
-    async function showPreview(){
-
+    async function showPreview() {
         const fullScreenButton = document.getElementById('full-screen');
-
 
         window.initRecording = initRecording;
         window.fullScreenPreview = fullScreenPreview;
 
-        const bitmap = await createImageBitmap(video);
-
+        // Store bitmap for model switching
+        previewBitmap = await createImageBitmap(video);
 
         const upscaled = upscaled_canvas.transferControlToOffscreen();
-        const original =    original_canvas.transferControlToOffscreen();
+        const original = original_canvas.transferControlToOffscreen();
 
+        Alpine.store('loading_message', 'Loading AI model...');
 
-        worker.postMessage({cmd: "init", data: {
-                bitmap,
+        const modelConfig = getModelConfig();
+
+        worker.postMessage({
+            cmd: "init",
+            data: {
+                bitmap: previewBitmap,
                 upscaled,
                 original,
                 resolution: {
                     width: video.videoWidth,
                     height: video.videoHeight
-                }
+                },
+                modelConfig
+            }
+        } satisfies WorkerRequestMessage, [upscaled, original]);
 
-            }}, [bitmap, upscaled, original]);
-
-
-        // Default to 'rl' (real life) network
-        content = 'rl';
-        await updateNetwork();
-        Alpine.store('style', 'rl');
-
-
-
-
-
-
-
-
-
-        function setFullScreenLocation(){
-            const containerWidth = Math.round(video.videoWidth/video.videoHeight*318);
+        function setFullScreenLocation() {
+            const containerWidth = Math.round(video.videoWidth / video.videoHeight * 318);
             const containerHeight = 318;
-            
+
             // Position at bottom-right of the preview container (with small padding)
-            fullScreenButton.style.left = `${imageCompare.offsetLeft + containerWidth - 20}px`;
-            fullScreenButton.style.top = `${imageCompare.offsetTop + containerHeight - 20}px`;
+            fullScreenButton!.style.left = `${imageCompare.offsetLeft + containerWidth - 20}px`;
+            fullScreenButton!.style.top = `${imageCompare.offsetTop + containerHeight - 20}px`;
         }
 
         setTimeout(setFullScreenLocation, 20);
         setTimeout(setFullScreenLocation, 60);
         setTimeout(setFullScreenLocation, 200);
 
-
-
-
-
         imageCompare.addEventListener('fullscreenchange', function () {
-            if(!document.fullscreenElement){
+            if (!document.fullscreenElement) {
                 // Reset canvas styles
                 upscaled_canvas.style.width = ``;
                 upscaled_canvas.style.height = ``;
                 original_canvas.style.width = ``;
                 original_canvas.style.height = ``;
-                
+
                 // Reset container styles to original preview dimensions
-                const imageCompareOuter = document.getElementById('image-compare-outer');
-                const imageCompareInner = document.getElementById('image-compare');
-                
+                const imageCompareOuter = document.getElementById('image-compare-outer')!;
+                const imageCompareInner = document.getElementById('image-compare')!;
+
                 // Reset outer container
                 imageCompareOuter.style.width = ``;
                 imageCompareOuter.style.height = ``;
@@ -275,10 +387,10 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
                 imageCompareOuter.style.display = ``;
                 imageCompareOuter.style.justifyContent = ``;
                 imageCompareOuter.style.alignItems = ``;
-                
+
                 // Reset inner container to original preview size
                 imageCompareInner.style.height = '318px';
-                imageCompareInner.style.width = `${Math.round(video.videoWidth/video.videoHeight*318)}px`;
+                imageCompareInner.style.width = `${Math.round(video.videoWidth / video.videoHeight * 318)}px`;
                 imageCompareInner.style.margin = 'auto';
                 imageCompareInner.style.position = 'relative';
             }
@@ -286,9 +398,9 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
 
         let bitrate = getBitrate();
 
-        const estimated_size = (bitrate/8)*video.duration + (128/8)*video.duration; // Assume 128 kbps audio
+        const estimated_size = (bitrate / 8) * video.duration + (128 / 8) * video.duration; // Assume 128 kbps audio
 
-        if(estimated_size > 1900*1024*1024){
+        if (estimated_size > 1900 * 1024 * 1024) {
             Alpine.store('target', 'writer');
         } else {
             Alpine.store('target', 'blob');
@@ -296,35 +408,33 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
 
         const quota = (await navigator.storage.estimate()).quota;
 
-        if(estimated_size > quota){
-            return showError(`The video is too big. It would output a file of ${humanFileSize(estimated_size)} but the browser can only write files up to ${humanFileSize(quota)}`);
+        if (estimated_size > quota!) {
+            return showError(`The video is too big. It would output a file of ${humanFileSize(estimated_size)} but the browser can only write files up to ${humanFileSize(quota!)}`);
         }
 
+        Alpine.store('size', humanFileSize(estimated_size));
 
-        Alpine.store('size', humanFileSize(estimated_size))
-
-
-        function canvasFullScreen(){
+        function canvasFullScreen() {
             // Calculate aspect ratios
             const videoAspectRatio = video.videoWidth / video.videoHeight;
             const screenAspectRatio = window.innerWidth / window.innerHeight;
-            
+
             let displayWidth, displayHeight;
 
-            const imageCompareOuter = document.getElementById('image-compare-outer');
-            const imageCompareInner = document.getElementById('image-compare');
-            
+            const imageCompareOuter = document.getElementById('image-compare-outer')!;
+            const imageCompareInner = document.getElementById('image-compare')!;
+
             // If video is wider than screen, fit to width (letterbox on top/bottom)
             if (videoAspectRatio > screenAspectRatio) {
                 displayWidth = window.innerWidth;
                 displayHeight = window.innerWidth / videoAspectRatio;
-            } 
+            }
             // If video is taller than screen, fit to height (pillarbox on sides)
             else {
                 displayWidth = window.innerHeight * videoAspectRatio;
                 displayHeight = window.innerHeight;
             }
-            
+
             // Style the outer container to fill screen with black background and center content
             imageCompareOuter.style.width = `${window.innerWidth}px`;
             imageCompareOuter.style.height = `${window.innerHeight}px`;
@@ -332,14 +442,11 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
             imageCompareOuter.style.display = 'flex';
             imageCompareOuter.style.justifyContent = 'center';
             imageCompareOuter.style.alignItems = 'center';
-            
 
-            console.log("Image Compare Outer", imageCompareOuter);
-            console.log("Image Compare Inner", imageCompareInner);
             // Size the inner container to maintain aspect ratio
             imageCompareInner.style.width = `${displayWidth}px`;
             imageCompareInner.style.height = `${displayHeight}px`;
-            
+
             // Let the canvases fill their parent container
             upscaled_canvas.style.width = `${displayWidth}px`;
             upscaled_canvas.style.height = `${displayHeight}px`;
@@ -347,51 +454,33 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
             original_canvas.style.height = `${displayHeight}px`;
         }
 
-        async function fullScreenPreview(e) {
+        async function fullScreenPreview(e: Event) {
             imageCompare.requestFullscreen();
             setTimeout(canvasFullScreen, 20);
             setTimeout(canvasFullScreen, 60);
             setTimeout(canvasFullScreen, 200);
-
         }
-
-
-        Alpine.store('state', 'preview');
-
-
-
-
-        window.switchNetworkSize = async function(el: HTMLInputElement){
-            if(el.value !== size){
-                size = el.value as NetworkSize;
-
-                await updateNetwork();
-            }
-        }
-
-        window.switchNetworkStyle = async function(el: HTMLInputElement){
-            if(el.value !== content){
-                content = el.value as ContentType;
-
-                await updateNetwork();
-            }
-        }
-
-
-
     }
-
 }
 
-
 /**
- * Handle messages from the video processing worker
+ * Handle messages from the video processing worker.
  */
 worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
     if (event.data.cmd === 'isSupported') {
         const supported = event.data.data;
-
         if (!supported) return showUnsupported("WebGPU");
+
+    } else if (event.data.cmd === 'modelLoading') {
+        const progress = event.data.data;
+        if (progress < 100) {
+            Alpine.store('loading_message', `Downloading AI model... ${progress}%`);
+        } else {
+            Alpine.store('loading_message', 'Initializing AI model...');
+        }
+
+    } else if (event.data.cmd === 'modelLoaded') {
+        Alpine.store('state', 'preview');
 
     } else if (event.data.cmd === 'progress') {
         Alpine.store('progress', event.data.data);
@@ -408,36 +497,22 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
 
     } else if (event.data.cmd === 'finished') {
         Alpine.store('state', 'complete');
-        const blob = new Blob([event.data.data], { type: "video/mp4" });
-        Alpine.store('download_url', window.URL.createObjectURL(blob));
+        if (event.data.data) {
+            const formatInfo = getFormatInfo(currentOutputFormat);
+            const blob = new Blob([event.data.data], { type: formatInfo?.mimeType || "video/mp4" });
+            Alpine.store('download_url', window.URL.createObjectURL(blob));
+        }
     }
 };
-
-
-
-/**
- * Switch to a different upscaling network
- */
-async function updateNetwork(): Promise<void> {
-    const bitmap = await createImageBitmap(video);
-
-    worker.postMessage({
-        cmd: 'network',
-        data: {
-            name: networks[size].name,
-            bitmap,
-            weights: weights[size][content]
-        }
-    } satisfies WorkerRequestMessage);
-}
 
 //===================  Process ===========================
 
 /**
- * Start the video upscaling process
+ * Start the video upscaling process.
  */
 async function initRecording(): Promise<void> {
     Alpine.store('state', 'loading');
+    Alpine.store('loading_message', 'Preparing to process...');
 
     let bitrate = getBitrate();
     const estimated_size = (bitrate / 8) * video.duration + (128 / 8) * video.duration; // Assume 128 kbps audio
@@ -454,15 +529,22 @@ async function initRecording(): Promise<void> {
         }
     }
 
+    const resPreset = getResolutionPreset(currentOutputResolution);
+
     worker.postMessage({
         cmd: "process",
         inputHandle: inputFileHandle,
-        outputHandle
+        outputHandle,
+        settings: {
+            outputFormat: currentOutputFormat,
+            outputResolution: currentOutputResolution,
+            targetHeight: resPreset?.maxHeight || undefined,
+        }
     } satisfies WorkerRequestMessage);
 }
 
 /**
- * Display error message to user
+ * Display error message to user.
  */
 function showError(message: string): void {
     Alpine.store('state', 'error');
@@ -470,14 +552,17 @@ function showError(message: string): void {
 }
 
 /**
- * Calculate target bitrate based on video resolution
+ * Calculate target bitrate based on video resolution.
  */
 function getBitrate(): number {
-    return 5e6 * (video.videoWidth * video.videoHeight * 4) / (1280 * 720);
+    const modelInfo = getModelInfo(currentModel);
+    const scale = modelInfo?.scale || 4;
+    // Upscaling = scale^2 pixels, adjust bitrate accordingly
+    return 5e6 * (video.videoWidth * video.videoHeight * scale * scale) / (1280 * 720);
 }
 
 /**
- * Format bytes into human-readable file size
+ * Format bytes into human-readable file size.
  */
 function humanFileSize(bytes: number, si: boolean = false, dp: number = 1): string {
     const thresh = si ? 1000 : 1024;
@@ -501,29 +586,19 @@ function humanFileSize(bytes: number, si: boolean = false, dp: number = 1): stri
 }
 
 /**
- * Show native file picker for saving output video
+ * Show native file picker for saving output video.
  */
 async function showFilePicker(): Promise<FileSystemFileHandle> {
+    const formatInfo = getFormatInfo(currentOutputFormat);
+
     const handle = await window.showSaveFilePicker({
         startIn: 'downloads',
         suggestedName: download_name,
         types: [{
             description: 'Video File',
-            accept: { 'video/mp4': ['.mp4'] }
+            accept: { [formatInfo?.mimeType || 'video/mp4']: [formatInfo?.extension || '.mp4'] }
         }],
     });
 
     return handle;
 }
-
-
-
-
-
-
-
-
-
-
-
-
