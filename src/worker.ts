@@ -74,17 +74,20 @@ async function init(config: InitData): Promise<void> {
 
     // Create upscaler
     upscaler = new Upscaler({
-      modelPath: config.modelConfig.modelPath,
+      modelId: config.modelConfig.modelId,
       scale: config.modelConfig.scale,
       tileSize: config.modelConfig.tileSize || 256,
       tilePadding: config.modelConfig.tilePadding || 16,
       denoiseLevel: config.modelConfig.denoiseLevel,
     });
 
-    // Initialize the model
-    postMessage({ cmd: 'modelLoading', data: 0 } satisfies WorkerResponseMessage);
+    // Progress callback for model loading
+    const onProgress = (progress: number, message: string) => {
+      postMessage({ cmd: 'modelLoading', data: progress } satisfies WorkerResponseMessage);
+    };
 
-    await upscaler.init(upscaled_canvas);
+    // Initialize the model with progress tracking
+    await upscaler.init(upscaled_canvas, onProgress);
 
     postMessage({ cmd: 'modelLoaded' } satisfies WorkerResponseMessage);
 
@@ -125,8 +128,6 @@ async function switchModel(data: SwitchModelData): Promise<void> {
   }
 
   try {
-    postMessage({ cmd: 'modelLoading', data: 0 } satisfies WorkerResponseMessage);
-
     // Update scale
     currentScale = data.modelConfig.scale;
 
@@ -136,14 +137,19 @@ async function switchModel(data: SwitchModelData): Promise<void> {
     original_canvas.width = resolution.width * currentScale;
     original_canvas.height = resolution.height * currentScale;
 
-    // Switch model
+    // Progress callback for model loading
+    const onProgress = (progress: number, message: string) => {
+      postMessage({ cmd: 'modelLoading', data: progress } satisfies WorkerResponseMessage);
+    };
+
+    // Switch model with progress tracking
     await upscaler.switchModel({
-      modelPath: data.modelConfig.modelPath,
+      modelId: data.modelConfig.modelId,
       scale: data.modelConfig.scale,
       tileSize: data.modelConfig.tileSize,
       tilePadding: data.modelConfig.tilePadding,
       denoiseLevel: data.modelConfig.denoiseLevel,
-    });
+    }, onProgress);
 
     postMessage({ cmd: 'modelLoaded' } satisfies WorkerResponseMessage);
 
@@ -185,7 +191,7 @@ function getOutputFormat(format: OutputFormat) {
 /**
  * Get codec for format.
  */
-function getCodec(format: OutputFormat): string {
+function getCodec(format: OutputFormat): 'avc' | 'vp9' | 'hevc' | 'av1' | 'vp8' {
   switch (format) {
     case 'webm':
       return 'vp9';

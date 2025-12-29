@@ -137,7 +137,7 @@ export interface UpscaleSettings {
 }
 
 export interface ModelConfig {
-  modelPath: string;
+  modelId: ModelType;
   scale: number;
   tileSize: number;
   tilePadding: number;

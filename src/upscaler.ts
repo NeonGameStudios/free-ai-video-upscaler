@@ -7,11 +7,12 @@
  * - Real-CUGAN: 2x, 4x (with denoising support)
  */
 
-import * as ort from 'onnxruntime-web/webgpu';
-import type { DenoiseLevel, ModelConfig } from './types/worker-messages';
+import * as ort from 'onnxruntime-web';
+import type { DenoiseLevel, ModelType } from './types/worker-messages';
+import { loadModel, type LoadProgressCallback } from './model-loader';
 
 export interface UpscalerConfig {
-  modelPath: string;
+  modelId: ModelType;
   scale: number;
   tileSize: number;
   tilePadding: number;
@@ -20,7 +21,7 @@ export interface UpscalerConfig {
 
 // Default configuration
 const DEFAULT_CONFIG: UpscalerConfig = {
-  modelPath: '/models/realesrgan-anime-fast.onnx',
+  modelId: 'realesrgan-anime-fast',
   scale: 4,
   tileSize: 256,
   tilePadding: 16,
@@ -47,10 +48,14 @@ export class Upscaler {
    */
   static async isWebGPUSupported(): Promise<boolean> {
     if (typeof navigator === 'undefined') return false;
-    if (!navigator.gpu) return false;
+
+    // Check for WebGPU support using type assertion
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const gpu = (navigator as any).gpu;
+    if (!gpu) return false;
 
     try {
-      const adapter = await navigator.gpu.requestAdapter();
+      const adapter = await gpu.requestAdapter();
       return adapter !== null;
     } catch {
       return false;
@@ -80,7 +85,10 @@ export class Upscaler {
   /**
    * Initialize the model and create inference session.
    */
-  async init(outputCanvas: OffscreenCanvas): Promise<void> {
+  async init(
+    outputCanvas: OffscreenCanvas,
+    onProgress?: LoadProgressCallback
+  ): Promise<void> {
     if (this.initialized) return;
 
     // Initialize ONNX Runtime
@@ -98,12 +106,18 @@ export class Upscaler {
     };
 
     console.log(`Creating inference session (WebGPU: ${this.useWebGPU})...`);
-    console.log(`Loading model: ${this.config.modelPath}`);
+    console.log(`Loading model: ${this.config.modelId}`);
 
     try {
-      // Load the model
+      // Download or retrieve model from cache
+      onProgress?.(0, 'Loading model...');
+      const modelData = await loadModel(this.config.modelId, onProgress);
+
+      onProgress?.(100, 'Initializing model...');
+
+      // Create session from ArrayBuffer
       this.session = await ort.InferenceSession.create(
-        this.config.modelPath,
+        modelData,
         sessionOptions
       );
 
@@ -125,7 +139,10 @@ export class Upscaler {
   /**
    * Switch to a different model.
    */
-  async switchModel(newConfig: Partial<UpscalerConfig>): Promise<void> {
+  async switchModel(
+    newConfig: Partial<UpscalerConfig>,
+    onProgress?: LoadProgressCallback
+  ): Promise<void> {
     // Dispose current session
     if (this.session) {
       await this.session.release();
@@ -138,7 +155,7 @@ export class Upscaler {
 
     // Re-initialize with new model
     if (this.canvas) {
-      await this.init(this.canvas);
+      await this.init(this.canvas, onProgress);
     }
   }
 
@@ -160,14 +177,25 @@ export class Upscaler {
   }
 
   /**
+   * Get dimensions from source (ImageBitmap or VideoFrame).
+   */
+  private getSourceDimensions(source: ImageBitmap | VideoFrame): { width: number; height: number } {
+    if ('codedWidth' in source) {
+      // VideoFrame
+      return { width: source.codedWidth, height: source.codedHeight };
+    }
+    // ImageBitmap
+    return { width: source.width, height: source.height };
+  }
+
+  /**
    * Preprocess an image for model input.
    * Converts ImageBitmap/VideoFrame to normalized Float32 tensor.
    */
   private async preprocess(
     source: ImageBitmap | VideoFrame
   ): Promise<{ tensor: ort.Tensor; width: number; height: number }> {
-    const width = source.width;
-    const height = source.height;
+    const { width, height } = this.getSourceDimensions(source);
 
     // Create temporary canvas for pixel extraction
     const tempCanvas = new OffscreenCanvas(width, height);
@@ -253,8 +281,7 @@ export class Upscaler {
       throw new Error('Upscaler not initialized');
     }
 
-    const inputWidth = source.width;
-    const inputHeight = source.height;
+    const { width: inputWidth, height: inputHeight } = this.getSourceDimensions(source);
     const outputWidth = inputWidth * this.config.scale;
     const outputHeight = inputHeight * this.config.scale;
 

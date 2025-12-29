@@ -212,7 +212,7 @@ function onResolutionChange(resolution: string): void {
 function getModelConfig(): ModelConfig {
     const modelInfo = getModelInfo(currentModel);
     return {
-        modelPath: `/models/${modelInfo?.modelFile || 'realesrgan-anime-fast.onnx'}`,
+        modelId: currentModel,
         scale: modelInfo?.scale || 4,
         tileSize: 256,
         tilePadding: 16,
@@ -472,7 +472,12 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
         if (!supported) return showUnsupported("WebGPU");
 
     } else if (event.data.cmd === 'modelLoading') {
-        Alpine.store('loading_message', 'Loading AI model...');
+        const progress = event.data.data;
+        if (progress < 100) {
+            Alpine.store('loading_message', `Downloading AI model... ${progress}%`);
+        } else {
+            Alpine.store('loading_message', 'Initializing AI model...');
+        }
 
     } else if (event.data.cmd === 'modelLoaded') {
         Alpine.store('state', 'preview');
