@@ -1,6 +1,8 @@
 /**
  * Type-safe worker message definitions for communication between
  * the main thread and the video processing worker.
+ *
+ * Updated for Real-ESRGAN integration.
  */
 
 export interface Resolution {
@@ -8,11 +10,17 @@ export interface Resolution {
   height: number;
 }
 
+export interface ModelConfig {
+  modelPath: string;
+  scale: number;
+  tileSize: number;
+  tilePadding: number;
+}
+
 // Messages sent FROM main thread TO worker
 export type WorkerRequestMessage =
   | { cmd: 'isSupported' }
   | { cmd: 'init'; data: InitData }
-  | { cmd: 'network'; data: NetworkData }
   | { cmd: 'process'; inputHandle: FileSystemFileHandle; outputHandle?: FileSystemFileHandle };
 
 export interface InitData {
@@ -20,17 +28,14 @@ export interface InitData {
   upscaled: OffscreenCanvas;
   original: OffscreenCanvas;
   resolution: Resolution;
-}
-
-export interface NetworkData {
-  name: string;
-  bitmap: ImageBitmap;
-  weights: any; // TODO: Type this based on WebSR weight structure
+  modelConfig?: Partial<ModelConfig>;
 }
 
 // Messages sent FROM worker TO main thread
 export type WorkerResponseMessage =
   | { cmd: 'isSupported'; data: boolean }
+  | { cmd: 'modelLoading'; data: number } // Progress 0-100 for model loading
+  | { cmd: 'modelLoaded' }
   | { cmd: 'progress'; data: number }
   | { cmd: 'eta'; data: string }
   | { cmd: 'process' }

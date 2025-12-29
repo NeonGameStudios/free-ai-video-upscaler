@@ -1,3 +1,10 @@
+/**
+ * Video processing worker using Real-ESRGAN for upscaling.
+ *
+ * This worker handles video frame extraction, AI upscaling with
+ * Real-ESRGAN (realesr-animevideov3), and video encoding.
+ */
+
 import {
   BlobSource,
   BufferTarget,
@@ -7,241 +14,235 @@ import {
   Mp4OutputFormat,
   Output,
   QUALITY_HIGH,
-  ReadableStreamSource,
   StreamTarget,
   VideoSample,
   VideoSampleSink,
 } from 'mediabunny';
 
-import WebSR from '@websr/websr';
+import { RealESRGAN } from './realesrgan';
 
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
   InitData,
-  NetworkData,
   Resolution
 } from './types/worker-messages';
 
 // Worker state
-let gpu: any | false;
-let websr: WebSR;
+let upscaler: RealESRGAN | null = null;
 let upscaled_canvas: OffscreenCanvas;
 let original_canvas: OffscreenCanvas;
 let resolution: Resolution;
 let ctx: ImageBitmapRenderingContext | null;
-
-// Default weights
-const weights = require('./weights/cnn-2x-m-rl.json');
+let scale: number = 4; // Real-ESRGAN animevideov3 is 4x by default
 
 /**
- * Check if WebGPU is supported in this environment
+ * Check if WebGPU is supported in this environment.
  */
 async function isSupported(): Promise<void> {
-  gpu = await WebSR.initWebGPU();
+  const supported = await RealESRGAN.isWebGPUSupported();
 
   postMessage({
     cmd: 'isSupported',
-    data: gpu !== false
+    data: supported
   } satisfies WorkerResponseMessage);
 }
 
 /**
- * Initialize the worker with canvases and create WebSR instance
+ * Initialize the worker with canvases and create Real-ESRGAN instance.
  */
 async function init(config: InitData): Promise<void> {
-  if (!gpu) {
-    gpu = await WebSR.initWebGPU();
-  }
+  try {
+    // Store canvases
+    upscaled_canvas = config.upscaled;
+    original_canvas = config.original;
+    resolution = config.resolution;
 
-  websr = new WebSR({
-    network_name: "anime4k/cnn-2x-m",
-    weights,
-    resolution: config.resolution,
-    gpu: gpu,
-    canvas: config.upscaled as any // OffscreenCanvas is valid but types may be strict
-  });
+    // Get the scale from config or use default
+    scale = config.modelConfig?.scale || 4;
 
-  resolution = config.resolution;
-  upscaled_canvas = config.upscaled;
-  original_canvas = config.original;
+    // Set up output canvas dimensions
+    upscaled_canvas.width = resolution.width * scale;
+    upscaled_canvas.height = resolution.height * scale;
 
-  ctx = original_canvas.getContext('bitmaprenderer');
+    // Set up original canvas context for "before" preview
+    ctx = original_canvas.getContext('bitmaprenderer');
 
-  const bitmap2 = await createImageBitmap(config.bitmap, {
-    resizeHeight: config.resolution.height * 2,
-    resizeWidth: config.resolution.width * 2,
-  });
+    // Create Real-ESRGAN upscaler
+    upscaler = new RealESRGAN({
+      modelPath: config.modelConfig?.modelPath || '/models/realesr-animevideov3.onnx',
+      scale: scale,
+      tileSize: config.modelConfig?.tileSize || 256,
+      tilePadding: config.modelConfig?.tilePadding || 16,
+    });
 
-  await websr.render(config.bitmap as any);
+    // Initialize the model
+    postMessage({ cmd: 'modelLoading', data: 0 } satisfies WorkerResponseMessage);
 
-  if (ctx) {
-    ctx.transferFromImageBitmap(bitmap2);
+    await upscaler.init(upscaled_canvas);
+
+    postMessage({ cmd: 'modelLoaded' } satisfies WorkerResponseMessage);
+
+    // Render preview frame
+    const bitmap = await createImageBitmap(config.bitmap, {
+      resizeHeight: resolution.height * scale,
+      resizeWidth: resolution.width * scale,
+    });
+
+    // Render the upscaled preview
+    await upscaler.render(config.bitmap);
+
+    // Render the "before" preview (bilinear upscale)
+    if (ctx) {
+      ctx.transferFromImageBitmap(bitmap);
+    }
+
+    bitmap.close();
+  } catch (e) {
+    console.error('Failed to initialize Real-ESRGAN:', e);
+    postMessage({
+      cmd: 'error',
+      data: `Failed to initialize AI upscaler: ${e}`
+    } satisfies WorkerResponseMessage);
   }
 }
 
 /**
- * Switch to a different AI upscaling network
- */
-async function switchNetwork(name: string, weights: any, bitmap: ImageBitmap): Promise<void> {
-  websr.switchNetwork(name as any, weights);
-
-  await websr.render(bitmap as any);
-}
-
-
-
-
-
-
-/**
- * Main video processing function using MediaBunny
+ * Main video processing function using MediaBunny.
  */
 async function initRecording(
   inputHandle: FileSystemFileHandle,
   outputHandle?: FileSystemFileHandle
 ): Promise<void> {
-
-  // Get the file from the handle
-  const file = await inputHandle.getFile();
-
-
-  // MediaBunny handles streaming from the blob for large files
-  const source = new BlobSource(file);
-
-
-
-  const input = new Input({
-    formats: [MP4],
-    source
-  });
-
-
-  let target: BufferTarget | StreamTarget;
-  let writer: WritableStream | undefined;
-
-  if (outputHandle) {
-    writer = await outputHandle.createWritable();
-    target = new StreamTarget(writer);
-  } else {
-    target = new BufferTarget();
+  if (!upscaler || !upscaler.isReady()) {
+    postMessage({
+      cmd: 'error',
+      data: 'Real-ESRGAN model not loaded'
+    } satisfies WorkerResponseMessage);
+    return;
   }
 
+  try {
+    // Get the file from the handle
+    const file = await inputHandle.getFile();
 
-  const output = new Output({
-    format: new Mp4OutputFormat(),
-    target: target,
-  });
+    // MediaBunny handles streaming from the blob for large files
+    const source = new BlobSource(file);
 
-  const videoSource = new CanvasSource(upscaled_canvas, {
-    codec: 'avc',
-    bitrate: QUALITY_HIGH,
-    keyFrameInterval: 60,
-  });
-
-  output.addVideoTrack(videoSource, { frameRate: 30 });
-  await output.start();
-
-
-
-  const videoTrack = await input.getPrimaryVideoTrack();
-
-  if (!videoTrack) {
-    //TODO: Handle
-  }
-
-  const decodable = await videoTrack.canDecode();
-  if (!decodable) {
-     // TODO: Handle
-  }
-
-
-
-  const sink = new VideoSampleSink(videoTrack);
-
-
-  const duration = await input.computeDuration();
-
-
-  const start_time = performance.now();
-
-
-  function reportProgress(sample: VideoSample){
-
-    const time_elapsed = performance.now() - start_time;
-    const progress  = Math.floor((sample.timestamp)/duration*100);
-
-     postMessage({cmd: 'progress', data: progress})
-
-      if(time_elapsed > 1000){
-        const processing_rate = ((sample.timestamp)/duration*100)/time_elapsed;
-        const eta = Math.round(((100-progress)/processing_rate)/1000);
-        postMessage({cmd: 'eta', data: prettyTime(eta)})
-
-    } else {
-        postMessage({cmd: 'eta', data: 'calculating...'})
-    }
-
-  }
-
-
-
-  // Loop over all frames
-  for await (const sample of sink.samples()) {
-   
-
-    const videoFrame = sample.toVideoFrame();
-
-
-    // This is for the 'before' preview. You can disable the before preview for performance
-    const bitmap = await createImageBitmap(videoFrame, {
-      resizeHeight: videoFrame.codedHeight*2,
-      resizeWidth: videoFrame.codedWidth*2
+    const input = new Input({
+      formats: [MP4],
+      source
     });
 
+    let target: BufferTarget | StreamTarget;
+    let writer: WritableStream | undefined;
 
-    //@ts-expect-error
-    websr.render(videoFrame); // Render the after in the actual network
- 
+    if (outputHandle) {
+      writer = await outputHandle.createWritable();
+      target = new StreamTarget(writer);
+    } else {
+      target = new BufferTarget();
+    }
 
-    // Render the "Before"
-    ctx.transferFromImageBitmap(bitmap)
+    const output = new Output({
+      format: new Mp4OutputFormat(),
+      target: target,
+    });
 
+    const videoSource = new CanvasSource(upscaled_canvas, {
+      codec: 'avc',
+      bitrate: QUALITY_HIGH,
+      keyFrameInterval: 60,
+    });
 
-    videoSource.add(sample.timestamp, sample.duration);
+    output.addVideoTrack(videoSource, { frameRate: 30 });
+    await output.start();
 
-    reportProgress(sample)
+    const videoTrack = await input.getPrimaryVideoTrack();
 
+    if (!videoTrack) {
+      postMessage({
+        cmd: 'error',
+        data: 'No video track found in input file'
+      } satisfies WorkerResponseMessage);
+      return;
+    }
 
-    videoFrame.close();
-    sample.close();
+    const decodable = await videoTrack.canDecode();
+    if (!decodable) {
+      postMessage({
+        cmd: 'error',
+        data: 'Video codec not supported for decoding'
+      } satisfies WorkerResponseMessage);
+      return;
+    }
 
+    const sink = new VideoSampleSink(videoTrack);
+    const duration = await input.computeDuration();
+    const start_time = performance.now();
 
+    function reportProgress(sample: VideoSample) {
+      const time_elapsed = performance.now() - start_time;
+      const progress = Math.floor((sample.timestamp) / duration * 100);
+
+      postMessage({ cmd: 'progress', data: progress });
+
+      if (time_elapsed > 1000) {
+        const processing_rate = ((sample.timestamp) / duration * 100) / time_elapsed;
+        const eta = Math.round(((100 - progress) / processing_rate) / 1000);
+        postMessage({ cmd: 'eta', data: prettyTime(eta) });
+      } else {
+        postMessage({ cmd: 'eta', data: 'calculating...' });
+      }
+    }
+
+    // Loop over all frames
+    for await (const sample of sink.samples()) {
+      const videoFrame = sample.toVideoFrame();
+
+      // Create "before" preview (bilinear upscale)
+      const bitmap = await createImageBitmap(videoFrame, {
+        resizeHeight: videoFrame.codedHeight * scale,
+        resizeWidth: videoFrame.codedWidth * scale
+      });
+
+      // Render through Real-ESRGAN
+      await upscaler.render(videoFrame);
+
+      // Render the "Before" preview
+      if (ctx) {
+        ctx.transferFromImageBitmap(bitmap);
+      }
+
+      // Add frame to output video
+      videoSource.add(sample.timestamp, sample.duration);
+
+      reportProgress(sample);
+
+      // Cleanup
+      videoFrame.close();
+      sample.close();
+    }
+
+    await output.finalize();
+
+    if (writer) {
+      postMessage({ cmd: 'finished', data: null }, []);
+    } else {
+      const buffer = (output.target as BufferTarget).buffer;
+      postMessage({ cmd: 'finished', data: buffer }, [buffer]);
+    }
+  } catch (e) {
+    console.error('Video processing error:', e);
+    postMessage({
+      cmd: 'error',
+      data: `Video processing failed: ${e}`
+    } satisfies WorkerResponseMessage);
   }
-
-
-
-  await output.finalize();
-
-
-  if(writer){
-
-    postMessage({cmd: 'finished', data: null}, []);
-
-  } else{
-    const buffer = (output.target as BufferTarget).buffer;
-    postMessage({cmd: 'finished', data: buffer}, [buffer]);
-  }
-
-
-
-
-
-
 }
 
 /**
- * Format seconds into HH:MM:SS or MM:SS
+ * Format seconds into HH:MM:SS or MM:SS.
  */
 function prettyTime(secs: number): string {
   const sec_num = parseInt(secs.toString(), 10);
@@ -256,7 +257,7 @@ function prettyTime(secs: number): string {
 }
 
 /**
- * Worker message handler with type-safe message routing
+ * Worker message handler with type-safe message routing.
  */
 self.onmessage = async function (event: MessageEvent<WorkerRequestMessage>) {
   if (!event.data.cmd) return;
@@ -272,14 +273,6 @@ self.onmessage = async function (event: MessageEvent<WorkerRequestMessage>) {
 
     case 'process':
       await initRecording(event.data.inputHandle, event.data.outputHandle);
-      break;
-
-    case 'network':
-      await switchNetwork(
-        event.data.data.name,
-        event.data.data.weights,
-        event.data.data.bitmap
-      );
       break;
   }
 };
