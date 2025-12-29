@@ -1,45 +1,44 @@
 /**
- * Real-ESRGAN inference module using ONNX Runtime Web with WebGPU.
+ * Unified upscaler module supporting Real-ESRGAN and Real-CUGAN models
+ * using ONNX Runtime Web with WebGPU acceleration.
  *
- * This module provides browser-based video upscaling using the
- * realesr-animevideov3 model, optimized for anime content.
+ * Supports:
+ * - Real-ESRGAN: anime_fast, anime_plus, general_fast, general_plus
+ * - Real-CUGAN: 2x, 4x (with denoising support)
  */
 
 import * as ort from 'onnxruntime-web/webgpu';
+import type { DenoiseLevel, ModelConfig } from './types/worker-messages';
 
-export interface RealESRGANConfig {
+export interface UpscalerConfig {
   modelPath: string;
   scale: number;
   tileSize: number;
   tilePadding: number;
-}
-
-export interface UpscaleResult {
-  width: number;
-  height: number;
-  data: Float32Array;
+  denoiseLevel?: DenoiseLevel;
 }
 
 // Default configuration
-const DEFAULT_CONFIG: RealESRGANConfig = {
-  modelPath: '/models/realesr-animevideov3.onnx',
+const DEFAULT_CONFIG: UpscalerConfig = {
+  modelPath: '/models/realesrgan-anime-fast.onnx',
   scale: 4,
-  tileSize: 256,    // Process in tiles to manage memory
-  tilePadding: 16,  // Overlap between tiles to avoid seams
+  tileSize: 256,
+  tilePadding: 16,
+  denoiseLevel: 0,
 };
 
 /**
- * Real-ESRGAN upscaler class for browser-based video upscaling.
+ * Unified upscaler class supporting Real-ESRGAN and Real-CUGAN models.
  */
-export class RealESRGAN {
+export class Upscaler {
   private session: ort.InferenceSession | null = null;
-  private config: RealESRGANConfig;
+  private config: UpscalerConfig;
   private canvas: OffscreenCanvas | null = null;
   private ctx: OffscreenCanvasRenderingContext2D | null = null;
   private initialized: boolean = false;
   private useWebGPU: boolean = false;
 
-  constructor(config: Partial<RealESRGANConfig> = {}) {
+  constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
@@ -85,10 +84,10 @@ export class RealESRGAN {
     if (this.initialized) return;
 
     // Initialize ONNX Runtime
-    await RealESRGAN.initORT();
+    await Upscaler.initORT();
 
     // Check WebGPU support
-    this.useWebGPU = await RealESRGAN.isWebGPUSupported();
+    this.useWebGPU = await Upscaler.isWebGPUSupported();
 
     // Create session options
     const sessionOptions: ort.InferenceSession.SessionOptions = {
@@ -99,6 +98,7 @@ export class RealESRGAN {
     };
 
     console.log(`Creating inference session (WebGPU: ${this.useWebGPU})...`);
+    console.log(`Loading model: ${this.config.modelPath}`);
 
     try {
       // Load the model
@@ -112,7 +112,7 @@ export class RealESRGAN {
       console.log('Output names:', this.session.outputNames);
     } catch (e) {
       console.error('Failed to load model:', e);
-      throw new Error(`Failed to load Real-ESRGAN model: ${e}`);
+      throw new Error(`Failed to load upscaling model: ${e}`);
     }
 
     // Set up output canvas
@@ -120,6 +120,43 @@ export class RealESRGAN {
     this.ctx = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
 
     this.initialized = true;
+  }
+
+  /**
+   * Switch to a different model.
+   */
+  async switchModel(newConfig: Partial<UpscalerConfig>): Promise<void> {
+    // Dispose current session
+    if (this.session) {
+      await this.session.release();
+      this.session = null;
+    }
+
+    // Update config
+    this.config = { ...this.config, ...newConfig };
+    this.initialized = false;
+
+    // Re-initialize with new model
+    if (this.canvas) {
+      await this.init(this.canvas);
+    }
+  }
+
+  /**
+   * Get the current scale factor.
+   */
+  getScale(): number {
+    return this.config.scale;
+  }
+
+  /**
+   * Update configuration without reloading model.
+   */
+  updateConfig(config: Partial<UpscalerConfig>): void {
+    // Only update non-model-related settings
+    if (config.tileSize !== undefined) this.config.tileSize = config.tileSize;
+    if (config.tilePadding !== undefined) this.config.tilePadding = config.tilePadding;
+    if (config.denoiseLevel !== undefined) this.config.denoiseLevel = config.denoiseLevel;
   }
 
   /**
@@ -148,7 +185,7 @@ export class RealESRGAN {
 
     for (let i = 0; i < height * width; i++) {
       // RGB channels (skip alpha)
-      tensorData[i] = pixels[i * 4] / 255.0;                    // R
+      tensorData[i] = pixels[i * 4] / 255.0;                          // R
       tensorData[height * width + i] = pixels[i * 4 + 1] / 255.0;     // G
       tensorData[2 * height * width + i] = pixels[i * 4 + 2] / 255.0; // B
     }
@@ -164,12 +201,12 @@ export class RealESRGAN {
    */
   private postprocess(
     output: ort.Tensor,
-    width: number,
-    height: number
+    inputWidth: number,
+    inputHeight: number
   ): ImageData {
     const data = output.data as Float32Array;
-    const outputWidth = width * this.config.scale;
-    const outputHeight = height * this.config.scale;
+    const outputWidth = inputWidth * this.config.scale;
+    const outputHeight = inputHeight * this.config.scale;
 
     // Create output pixel array (RGBA)
     const pixels = new Uint8ClampedArray(outputWidth * outputHeight * 4);
@@ -213,7 +250,7 @@ export class RealESRGAN {
    */
   async upscale(source: ImageBitmap | VideoFrame): Promise<void> {
     if (!this.initialized || !this.session || !this.canvas || !this.ctx) {
-      throw new Error('RealESRGAN not initialized');
+      throw new Error('Upscaler not initialized');
     }
 
     const inputWidth = source.width;
@@ -241,8 +278,9 @@ export class RealESRGAN {
     }
 
     // Tiled processing for larger images
-    const tilesX = Math.ceil(inputWidth / (tileSize - 2 * tilePadding));
-    const tilesY = Math.ceil(inputHeight / (tileSize - 2 * tilePadding));
+    const effectiveTileSize = tileSize - 2 * tilePadding;
+    const tilesX = Math.ceil(inputWidth / effectiveTileSize);
+    const tilesY = Math.ceil(inputHeight / effectiveTileSize);
 
     // Create temporary canvas for tile extraction
     const tileCanvas = new OffscreenCanvas(tileSize, tileSize);
@@ -251,8 +289,8 @@ export class RealESRGAN {
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
         // Calculate tile bounds with padding
-        const srcX = Math.max(0, tx * (tileSize - 2 * tilePadding) - tilePadding);
-        const srcY = Math.max(0, ty * (tileSize - 2 * tilePadding) - tilePadding);
+        const srcX = Math.max(0, tx * effectiveTileSize - tilePadding);
+        const srcY = Math.max(0, ty * effectiveTileSize - tilePadding);
         const srcW = Math.min(tileSize, inputWidth - srcX);
         const srcH = Math.min(tileSize, inputHeight - srcY);
 
@@ -272,22 +310,26 @@ export class RealESRGAN {
         // Calculate output position (accounting for padding)
         const padOffsetX = srcX === 0 ? 0 : tilePadding * scale;
         const padOffsetY = srcY === 0 ? 0 : tilePadding * scale;
-        const dstX = srcX * scale + padOffsetX;
-        const dstY = srcY * scale + padOffsetY;
 
-        // Copy to output, excluding padded regions
-        const copyW = outputImageData.width - (srcX === 0 ? 0 : padOffsetX) -
-                     (srcX + srcW >= inputWidth ? 0 : tilePadding * scale);
-        const copyH = outputImageData.height - (srcY === 0 ? 0 : padOffsetY) -
-                     (srcY + srcH >= inputHeight ? 0 : tilePadding * scale);
+        // Destination position
+        const dstX = tx * effectiveTileSize * scale;
+        const dstY = ty * effectiveTileSize * scale;
+
+        // Calculate the region to copy (excluding padding on edges)
+        const copyStartX = srcX === 0 ? 0 : tilePadding * scale;
+        const copyStartY = srcY === 0 ? 0 : tilePadding * scale;
+        const copyEndX = (srcX + srcW >= inputWidth) ? srcW * scale : srcW * scale - tilePadding * scale;
+        const copyEndY = (srcY + srcH >= inputHeight) ? srcH * scale : srcH * scale - tilePadding * scale;
+        const copyW = copyEndX - copyStartX;
+        const copyH = copyEndY - copyStartY;
 
         // Put tile on output canvas
         this.ctx.putImageData(
           outputImageData,
-          dstX - padOffsetX,
-          dstY - padOffsetY,
-          padOffsetX / scale,
-          padOffsetY / scale,
+          dstX,
+          dstY,
+          copyStartX,
+          copyStartY,
           copyW,
           copyH
         );
@@ -305,13 +347,6 @@ export class RealESRGAN {
    */
   async render(frame: ImageBitmap | VideoFrame): Promise<void> {
     await this.upscale(frame);
-  }
-
-  /**
-   * Get the current scale factor.
-   */
-  getScale(): number {
-    return this.config.scale;
   }
 
   /**
@@ -333,4 +368,4 @@ export class RealESRGAN {
   }
 }
 
-export default RealESRGAN;
+export default Upscaler;

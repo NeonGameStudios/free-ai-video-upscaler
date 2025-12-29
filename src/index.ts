@@ -1,13 +1,30 @@
 /**
  * Free AI Video Upscaler - Main Application
  *
- * Browser-based video upscaling using Real-ESRGAN (realesr-animevideov3).
+ * Browser-based video upscaling using Real-ESRGAN and Real-CUGAN models.
  * All processing happens locally in the browser using WebGPU acceleration.
  */
 
 import Alpine from 'alpinejs';
 import ImageCompare from './lib/image-compare-viewer.min';
-import type { WorkerRequestMessage, WorkerResponseMessage } from './types/worker-messages';
+import {
+  AVAILABLE_MODELS,
+  OUTPUT_FORMATS,
+  RESOLUTION_PRESETS,
+  getModelInfo,
+  getFormatInfo,
+  getResolutionPreset,
+} from './types/worker-messages';
+import type {
+  WorkerRequestMessage,
+  WorkerResponseMessage,
+  ModelType,
+  ModelInfo,
+  DenoiseLevel,
+  OutputFormat,
+  OutputResolution,
+  ModelConfig,
+} from './types/worker-messages';
 
 import 'bootstrap';
 import 'bootstrap/dist/css/bootstrap.min.css';
@@ -21,9 +38,13 @@ const worker = new Worker(new URL('./worker.ts', import.meta.url));
 let upscaled_canvas: HTMLCanvasElement;
 let original_canvas: HTMLCanvasElement;
 let video: HTMLVideoElement;
+let previewBitmap: ImageBitmap | null = null;
 
-// Real-ESRGAN uses 4x upscaling
-const UPSCALE_FACTOR = 4;
+// Current settings
+let currentModel: ModelType = 'realesrgan-anime-fast';
+let currentDenoiseLevel: DenoiseLevel = 0;
+let currentOutputFormat: OutputFormat = 'mp4';
+let currentOutputResolution: OutputResolution = 'auto';
 
 // Video data
 let download_name: string;
@@ -35,6 +56,10 @@ declare global {
         chooseFile: (e?: Event) => Promise<void>;
         initRecording: () => Promise<void>;
         fullScreenPreview: (e?: Event) => Promise<void>;
+        onModelChange: (modelId: string) => Promise<void>;
+        onDenoiseChange: (level: number) => void;
+        onFormatChange: (format: string) => void;
+        onResolutionChange: (resolution: string) => void;
         showSaveFilePicker: (options?: any) => Promise<FileSystemFileHandle>;
         showOpenFilePicker: (options?: any) => Promise<FileSystemFileHandle[]>;
     }
@@ -49,7 +74,21 @@ document.addEventListener("DOMContentLoaded", index);
  */
 async function index(): Promise<void> {
     Alpine.store('state', 'init');
-    Alpine.store('upscale_factor', UPSCALE_FACTOR);
+
+    // Initialize settings stores
+    Alpine.store('models', AVAILABLE_MODELS);
+    Alpine.store('formats', OUTPUT_FORMATS);
+    Alpine.store('resolutions', RESOLUTION_PRESETS);
+
+    Alpine.store('selectedModel', currentModel);
+    Alpine.store('selectedDenoise', currentDenoiseLevel);
+    Alpine.store('selectedFormat', currentOutputFormat);
+    Alpine.store('selectedResolution', currentOutputResolution);
+
+    // Get initial model info
+    const modelInfo = getModelInfo(currentModel);
+    Alpine.store('currentScale', modelInfo?.scale || 4);
+    Alpine.store('supportsDenoising', modelInfo?.supportsDenoising || false);
 
     Alpine.start();
     document.body.style.display = "block";
@@ -63,7 +102,12 @@ async function index(): Promise<void> {
 
     worker.postMessage({ cmd: 'isSupported' } satisfies WorkerRequestMessage);
 
+    // Set up global functions
     window.chooseFile = chooseFile;
+    window.onModelChange = onModelChange;
+    window.onDenoiseChange = onDenoiseChange;
+    window.onFormatChange = onFormatChange;
+    window.onResolutionChange = onResolutionChange;
 }
 
 /**
@@ -94,6 +138,126 @@ async function chooseFile(e?: Event): Promise<void> {
     }
 }
 
+//===================  Settings Handlers ===========================
+
+/**
+ * Handle model selection change.
+ */
+async function onModelChange(modelId: string): Promise<void> {
+    const modelInfo = getModelInfo(modelId as ModelType);
+    if (!modelInfo) return;
+
+    currentModel = modelId as ModelType;
+    Alpine.store('selectedModel', currentModel);
+    Alpine.store('currentScale', modelInfo.scale);
+    Alpine.store('supportsDenoising', modelInfo.supportsDenoising);
+
+    // Reset denoise level if model doesn't support it
+    if (!modelInfo.supportsDenoising) {
+        currentDenoiseLevel = 0;
+        Alpine.store('selectedDenoise', 0);
+    }
+
+    // Update output dimensions display
+    if (video) {
+        updateOutputDimensions();
+    }
+
+    // If we have a preview, switch the model
+    if (previewBitmap && Alpine.store('state') === 'preview') {
+        Alpine.store('state', 'loading');
+        Alpine.store('loading_message', 'Switching model...');
+
+        const modelConfig = getModelConfig();
+
+        worker.postMessage({
+            cmd: 'switchModel',
+            data: {
+                bitmap: previewBitmap,
+                modelConfig
+            }
+        } satisfies WorkerRequestMessage);
+    }
+}
+
+/**
+ * Handle denoise level change.
+ */
+function onDenoiseChange(level: number): void {
+    currentDenoiseLevel = level as DenoiseLevel;
+    Alpine.store('selectedDenoise', currentDenoiseLevel);
+}
+
+/**
+ * Handle output format change.
+ */
+function onFormatChange(format: string): void {
+    currentOutputFormat = format as OutputFormat;
+    Alpine.store('selectedFormat', currentOutputFormat);
+    updateDownloadName();
+}
+
+/**
+ * Handle output resolution change.
+ */
+function onResolutionChange(resolution: string): void {
+    currentOutputResolution = resolution as OutputResolution;
+    Alpine.store('selectedResolution', currentOutputResolution);
+    updateOutputDimensions();
+}
+
+/**
+ * Get current model configuration.
+ */
+function getModelConfig(): ModelConfig {
+    const modelInfo = getModelInfo(currentModel);
+    return {
+        modelPath: `/models/${modelInfo?.modelFile || 'realesrgan-anime-fast.onnx'}`,
+        scale: modelInfo?.scale || 4,
+        tileSize: 256,
+        tilePadding: 16,
+        denoiseLevel: modelInfo?.supportsDenoising ? currentDenoiseLevel : undefined,
+    };
+}
+
+/**
+ * Update output dimensions display based on current settings.
+ */
+function updateOutputDimensions(): void {
+    if (!video) return;
+
+    const modelInfo = getModelInfo(currentModel);
+    const scale = modelInfo?.scale || 4;
+    const resPreset = getResolutionPreset(currentOutputResolution);
+
+    let outputWidth = video.videoWidth * scale;
+    let outputHeight = video.videoHeight * scale;
+
+    // Apply resolution limit if not auto
+    if (resPreset && resPreset.maxHeight !== null && outputHeight > resPreset.maxHeight) {
+        const aspectRatio = outputWidth / outputHeight;
+        outputHeight = resPreset.maxHeight;
+        outputWidth = Math.round(outputHeight * aspectRatio);
+    }
+
+    Alpine.store('outputWidth', outputWidth);
+    Alpine.store('outputHeight', outputHeight);
+}
+
+/**
+ * Update download filename based on current settings.
+ */
+function updateDownloadName(): void {
+    if (!video) return;
+
+    const formatInfo = getFormatInfo(currentOutputFormat);
+    const modelInfo = getModelInfo(currentModel);
+    const baseName = (Alpine.store('filename') as string)?.split(".")[0] || 'video';
+
+    download_name = `${baseName}-upscaled-${modelInfo?.scale || 4}x${formatInfo?.extension || '.mp4'}`;
+    Alpine.store('download_name', download_name);
+}
+
 //===================  Preview ===========================
 
 /**
@@ -109,10 +273,9 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     // Get the file to create a preview
     const file = await fileHandle.getFile();
 
-    // Set up download name
-    download_name = file.name.split(".")[0] + "-upscaled-4x.mp4";
-    Alpine.store('download_name', download_name);
+    // Set up initial filename
     Alpine.store('filename', file.name);
+    updateDownloadName();
 
     // Read file for preview setup
     const arrayBuffer = await file.arrayBuffer();
@@ -135,11 +298,17 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
         Alpine.store('width', video.videoWidth);
         Alpine.store('height', video.videoHeight);
 
-        // Set canvas dimensions for 4x upscaling
-        upscaled_canvas.width = video.videoWidth * UPSCALE_FACTOR;
-        upscaled_canvas.height = video.videoHeight * UPSCALE_FACTOR;
-        original_canvas.width = video.videoWidth * UPSCALE_FACTOR;
-        original_canvas.height = video.videoHeight * UPSCALE_FACTOR;
+        // Update output dimensions
+        updateOutputDimensions();
+
+        const modelInfo = getModelInfo(currentModel);
+        const scale = modelInfo?.scale || 4;
+
+        // Set canvas dimensions
+        upscaled_canvas.width = video.videoWidth * scale;
+        upscaled_canvas.height = video.videoHeight * scale;
+        original_canvas.width = video.videoWidth * scale;
+        original_canvas.height = video.videoHeight * scale;
 
         imageCompare.style.height = '318px';
         imageCompare.style.width = `${Math.round(video.videoWidth / video.videoHeight * 318)}px`;
@@ -162,25 +331,29 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
         window.initRecording = initRecording;
         window.fullScreenPreview = fullScreenPreview;
 
-        const bitmap = await createImageBitmap(video);
+        // Store bitmap for model switching
+        previewBitmap = await createImageBitmap(video);
 
         const upscaled = upscaled_canvas.transferControlToOffscreen();
         const original = original_canvas.transferControlToOffscreen();
 
         Alpine.store('loading_message', 'Loading AI model...');
 
+        const modelConfig = getModelConfig();
+
         worker.postMessage({
             cmd: "init",
             data: {
-                bitmap,
+                bitmap: previewBitmap,
                 upscaled,
                 original,
                 resolution: {
                     width: video.videoWidth,
                     height: video.videoHeight
-                }
+                },
+                modelConfig
             }
-        } satisfies WorkerRequestMessage, [bitmap, upscaled, original]);
+        } satisfies WorkerRequestMessage, [upscaled, original]);
 
         function setFullScreenLocation() {
             const containerWidth = Math.round(video.videoWidth / video.videoHeight * 318);
@@ -320,7 +493,8 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
     } else if (event.data.cmd === 'finished') {
         Alpine.store('state', 'complete');
         if (event.data.data) {
-            const blob = new Blob([event.data.data], { type: "video/mp4" });
+            const formatInfo = getFormatInfo(currentOutputFormat);
+            const blob = new Blob([event.data.data], { type: formatInfo?.mimeType || "video/mp4" });
             Alpine.store('download_url', window.URL.createObjectURL(blob));
         }
     }
@@ -350,10 +524,17 @@ async function initRecording(): Promise<void> {
         }
     }
 
+    const resPreset = getResolutionPreset(currentOutputResolution);
+
     worker.postMessage({
         cmd: "process",
         inputHandle: inputFileHandle,
-        outputHandle
+        outputHandle,
+        settings: {
+            outputFormat: currentOutputFormat,
+            outputResolution: currentOutputResolution,
+            targetHeight: resPreset?.maxHeight || undefined,
+        }
     } satisfies WorkerRequestMessage);
 }
 
@@ -367,11 +548,12 @@ function showError(message: string): void {
 
 /**
  * Calculate target bitrate based on video resolution.
- * Adjusted for 4x upscaling (16x pixel count).
  */
 function getBitrate(): number {
-    // 4x upscaling = 16x pixels, adjust bitrate accordingly
-    return 5e6 * (video.videoWidth * video.videoHeight * UPSCALE_FACTOR * UPSCALE_FACTOR) / (1280 * 720);
+    const modelInfo = getModelInfo(currentModel);
+    const scale = modelInfo?.scale || 4;
+    // Upscaling = scale^2 pixels, adjust bitrate accordingly
+    return 5e6 * (video.videoWidth * video.videoHeight * scale * scale) / (1280 * 720);
 }
 
 /**
@@ -402,12 +584,14 @@ function humanFileSize(bytes: number, si: boolean = false, dp: number = 1): stri
  * Show native file picker for saving output video.
  */
 async function showFilePicker(): Promise<FileSystemFileHandle> {
+    const formatInfo = getFormatInfo(currentOutputFormat);
+
     const handle = await window.showSaveFilePicker({
         startIn: 'downloads',
         suggestedName: download_name,
         types: [{
             description: 'Video File',
-            accept: { 'video/mp4': ['.mp4'] }
+            accept: { [formatInfo?.mimeType || 'video/mp4']: [formatInfo?.extension || '.mp4'] }
         }],
     });
 
