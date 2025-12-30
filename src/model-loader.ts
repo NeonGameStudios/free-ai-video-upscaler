@@ -18,6 +18,11 @@ const MODEL_URLS: Record<ModelType, string> = {
   // RealESR AnimeVideo v3 - compact model optimized for anime videos
   // Uses lightweight 4B32F architecture from xiongjie's repo
   'realesr-animevideov3': 'https://huggingface.co/xiongjie/lightweight-real-ESRGAN-anime/resolve/main/RealESRGAN_x4plus_anime_4B32F.onnx',
+  // AnimeJaNai V3 models - placeholder URLs (need to be hosted)
+  // Download from: https://github.com/the-database/mpv-upscale-2x_animejanai/releases
+  // Convert .pth to .onnx using chaiNNer, then host on Hugging Face
+  'animejanai-v3-sd': '',
+  'animejanai-v3-hd': '',
   // Real-ESRGAN models - using deepghs/imgutils-models repository
   'realesrgan-anime-fast': 'https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx',
   'realesrgan-anime-plus': 'https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx',
@@ -31,6 +36,8 @@ const MODEL_URLS: Record<ModelType, string> = {
 // Model file sizes for progress calculation (approximate, in bytes)
 const MODEL_SIZES: Record<ModelType, number> = {
   'realesr-animevideov3': 5_160_000,    // ~5.16 MB (compact model)
+  'animejanai-v3-sd': 5_000_000,        // ~5 MB estimated (compact)
+  'animejanai-v3-hd': 5_000_000,        // ~5 MB estimated (compact)
   'realesrgan-anime-fast': 17_900_000,  // ~17.9 MB
   'realesrgan-anime-plus': 17_900_000,  // ~17.9 MB
   'realesrgan-general-fast': 67_100_000, // ~67.1 MB
