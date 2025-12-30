@@ -13,6 +13,8 @@ export interface Resolution {
 // Available upscaling models
 export type ModelType =
   | 'realesr-animevideov3'
+  | 'animejanai-v3-sd'
+  | 'animejanai-v3-hd'
   | 'realesrgan-anime-fast'
   | 'realesrgan-anime-plus'
   | 'realesrgan-general-fast'
@@ -39,6 +41,22 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     scale: 4,
     supportsDenoising: false,
     modelFile: 'realesr-animevideov3.onnx'
+  },
+  {
+    id: 'animejanai-v3-sd',
+    name: 'AnimeJaNai V3 - SD',
+    description: 'Soft upscaling, faithful to source (2x)',
+    scale: 2,
+    supportsDenoising: false,
+    modelFile: 'animejanai-v3-sd.onnx'
+  },
+  {
+    id: 'animejanai-v3-hd',
+    name: 'AnimeJaNai V3 - HD',
+    description: 'Sharp upscaling for high quality sources (2x)',
+    scale: 2,
+    supportsDenoising: false,
+    modelFile: 'animejanai-v3-hd.onnx'
   },
   {
     id: 'realesrgan-anime-fast',
