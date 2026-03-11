@@ -15,6 +15,7 @@ import {
   getFormatInfo,
   getResolutionPreset,
 } from './types/worker-messages';
+import { isModelAvailable } from './model-loader';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
@@ -76,7 +77,10 @@ async function index(): Promise<void> {
     Alpine.store('state', 'init');
 
     // Initialize settings stores
-    Alpine.store('models', AVAILABLE_MODELS);
+    Alpine.store('models', AVAILABLE_MODELS.map(m => ({
+        ...m,
+        available: isModelAvailable(m.id),
+    })));
     Alpine.store('formats', OUTPUT_FORMATS);
     Alpine.store('resolutions', RESOLUTION_PRESETS);
 
@@ -146,6 +150,12 @@ async function chooseFile(e?: Event): Promise<void> {
 async function onModelChange(modelId: string): Promise<void> {
     const modelInfo = getModelInfo(modelId as ModelType);
     if (!modelInfo) return;
+
+    // Reject unavailable models
+    if (!isModelAvailable(modelId as ModelType)) {
+        console.warn(`Model "${modelId}" is not yet available for download.`);
+        return;
+    }
 
     currentModel = modelId as ModelType;
     Alpine.store('selectedModel', currentModel);

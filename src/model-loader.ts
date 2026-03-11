@@ -46,7 +46,23 @@ const MODEL_SIZES: Record<ModelType, number> = {
   'realcugan-4x': 40_000_000,  // Estimated ~40 MB
 };
 
+// Maximum number of download retry attempts
+const MAX_RETRIES = 3;
+
 export type LoadProgressCallback = (progress: number, message: string) => void;
+
+/**
+ * Validate that a buffer contains a valid ONNX model.
+ * ONNX uses protobuf format; the first bytes should contain a valid protobuf
+ * field tag. A minimal check: the buffer must be non-empty and start with
+ * a valid protobuf field header (tag 0x08 for the ir_version field).
+ */
+function isValidOnnxModel(data: ArrayBuffer): boolean {
+  if (data.byteLength < 8) return false;
+  const view = new Uint8Array(data);
+  // ONNX protobuf starts with field 1 (ir_version), wire type 0 → tag byte 0x08
+  return view[0] === 0x08;
+}
 
 /**
  * Open the IndexedDB database.
@@ -193,7 +209,35 @@ function formatBytes(bytes: number): string {
 }
 
 /**
+ * Evict a single model from the IndexedDB cache.
+ */
+async function evictCachedModel(modelId: ModelType): Promise<void> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.delete(modelId);
+
+      request.onerror = () => {
+        console.warn('Failed to evict cached model:', request.error);
+        db.close();
+        resolve();
+      };
+
+      request.onsuccess = () => {
+        db.close();
+        resolve();
+      };
+    });
+  } catch (e) {
+    console.warn('Failed to evict cached model:', e);
+  }
+}
+
+/**
  * Load a model by ID, downloading if necessary.
+ * Validates ONNX data and retries on corrupt downloads.
  * Returns an ArrayBuffer containing the model data.
  */
 export async function loadModel(
@@ -205,8 +249,13 @@ export async function loadModel(
   const cached = await getCachedModel(modelId);
 
   if (cached) {
-    onProgress?.(100, 'Loaded from cache');
-    return cached;
+    if (isValidOnnxModel(cached)) {
+      onProgress?.(100, 'Loaded from cache');
+      return cached;
+    }
+    // Cached data is corrupt — evict and re-download
+    console.warn(`Cached model "${modelId}" is corrupt, re-downloading...`);
+    await evictCachedModel(modelId);
   }
 
   // Get download URL
@@ -219,15 +268,39 @@ export async function loadModel(
     );
   }
 
-  // Download the model
-  onProgress?.(0, 'Starting download...');
-  const data = await downloadModel(url, MODEL_SIZES[modelId], onProgress);
+  // Download the model with retry logic
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      onProgress?.(0, attempt > 1 ? `Retrying download (attempt ${attempt}/${MAX_RETRIES})...` : 'Starting download...');
+      const data = await downloadModel(url, MODEL_SIZES[modelId], onProgress);
 
-  // Cache for future use
-  onProgress?.(100, 'Caching model...');
-  await cacheModel(modelId, data);
+      // Validate the downloaded data
+      if (!isValidOnnxModel(data)) {
+        throw new Error('Downloaded file is not a valid ONNX model');
+      }
 
-  return data;
+      // Cache for future use
+      onProgress?.(100, 'Caching model...');
+      await cacheModel(modelId, data);
+
+      return data;
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      console.warn(`Download attempt ${attempt}/${MAX_RETRIES} failed for "${modelId}":`, lastError.message);
+
+      if (attempt < MAX_RETRIES) {
+        // Exponential backoff: 1s, 2s, 4s
+        const delay = 1000 * Math.pow(2, attempt - 1);
+        onProgress?.(0, `Download failed, retrying in ${delay / 1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw new Error(
+    `Failed to download model "${modelId}" after ${MAX_RETRIES} attempts: ${lastError?.message}`
+  );
 }
 
 /**

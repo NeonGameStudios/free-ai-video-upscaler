@@ -29,7 +29,6 @@ export interface ModelInfo {
   description: string;
   scale: number;
   supportsDenoising: boolean;
-  modelFile: string;
 }
 
 // All available models
@@ -40,7 +39,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'Optimized for anime videos (4x) - Recommended',
     scale: 4,
     supportsDenoising: false,
-    modelFile: 'realesr-animevideov3.onnx'
   },
   {
     id: 'animejanai-v3-sd',
@@ -48,7 +46,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'Soft upscaling, faithful to source (2x)',
     scale: 2,
     supportsDenoising: false,
-    modelFile: 'animejanai-v3-sd.onnx'
   },
   {
     id: 'animejanai-v3-hd',
@@ -56,7 +53,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'Sharp upscaling for high quality sources (2x)',
     scale: 2,
     supportsDenoising: false,
-    modelFile: 'animejanai-v3-hd.onnx'
   },
   {
     id: 'realesrgan-anime-fast',
@@ -64,7 +60,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'Fast anime upscaling (4x)',
     scale: 4,
     supportsDenoising: false,
-    modelFile: 'realesrgan-anime-fast.onnx'
   },
   {
     id: 'realesrgan-anime-plus',
@@ -72,7 +67,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'High quality anime upscaling (4x)',
     scale: 4,
     supportsDenoising: false,
-    modelFile: 'realesrgan-anime-plus.onnx'
   },
   {
     id: 'realesrgan-general-fast',
@@ -80,7 +74,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'Fast general content upscaling (4x)',
     scale: 4,
     supportsDenoising: false,
-    modelFile: 'realesrgan-general-fast.onnx'
   },
   {
     id: 'realesrgan-general-plus',
@@ -88,7 +81,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'High quality general content upscaling (4x)',
     scale: 4,
     supportsDenoising: false,
-    modelFile: 'realesrgan-general-plus.onnx'
   },
   {
     id: 'realcugan-2x',
@@ -96,7 +88,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'Conservative anime upscaling with denoising (2x)',
     scale: 2,
     supportsDenoising: true,
-    modelFile: 'realcugan-2x.onnx'
   },
   {
     id: 'realcugan-4x',
@@ -104,7 +95,6 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     description: 'High quality anime upscaling with denoising (4x)',
     scale: 4,
     supportsDenoising: true,
-    modelFile: 'realcugan-4x.onnx'
   }
 ];
 
