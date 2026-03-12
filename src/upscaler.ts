@@ -296,11 +296,15 @@ export class Upscaler {
     // For small images, process in one go
     if (inputWidth <= tileSize && inputHeight <= tileSize) {
       const { tensor } = await this.preprocess(source);
-      const output = await this.upscaleTile(tensor);
-      const imageData = this.postprocess(output, inputWidth, inputHeight);
-      this.ctx.putImageData(imageData, 0, 0);
-      tensor.dispose();
-      output.dispose();
+      let output: ort.Tensor | null = null;
+      try {
+        output = await this.upscaleTile(tensor);
+        const imageData = this.postprocess(output, inputWidth, inputHeight);
+        this.ctx.putImageData(imageData, 0, 0);
+      } finally {
+        tensor.dispose();
+        output?.dispose();
+      }
       return;
     }
 
@@ -329,42 +333,43 @@ export class Upscaler {
         const tileImageData = tileCtx.getImageData(0, 0, srcW, srcH);
         const tileBitmap = await createImageBitmap(tileImageData);
 
-        // Process tile
-        const { tensor } = await this.preprocess(tileBitmap);
-        const output = await this.upscaleTile(tensor);
-        const outputImageData = this.postprocess(output, srcW, srcH);
+        // Process tile with guaranteed cleanup
+        let tensor: ort.Tensor | null = null;
+        let output: ort.Tensor | null = null;
+        try {
+          const preprocessed = await this.preprocess(tileBitmap);
+          tensor = preprocessed.tensor;
+          output = await this.upscaleTile(tensor);
+          const outputImageData = this.postprocess(output, srcW, srcH);
 
-        // Calculate output position (accounting for padding)
-        const padOffsetX = srcX === 0 ? 0 : tilePadding * scale;
-        const padOffsetY = srcY === 0 ? 0 : tilePadding * scale;
+          // Destination position
+          const dstX = tx * effectiveTileSize * scale;
+          const dstY = ty * effectiveTileSize * scale;
 
-        // Destination position
-        const dstX = tx * effectiveTileSize * scale;
-        const dstY = ty * effectiveTileSize * scale;
+          // Calculate the region to copy (excluding padding on edges)
+          const copyStartX = srcX === 0 ? 0 : tilePadding * scale;
+          const copyStartY = srcY === 0 ? 0 : tilePadding * scale;
+          const copyEndX = (srcX + srcW >= inputWidth) ? srcW * scale : srcW * scale - tilePadding * scale;
+          const copyEndY = (srcY + srcH >= inputHeight) ? srcH * scale : srcH * scale - tilePadding * scale;
+          const copyW = copyEndX - copyStartX;
+          const copyH = copyEndY - copyStartY;
 
-        // Calculate the region to copy (excluding padding on edges)
-        const copyStartX = srcX === 0 ? 0 : tilePadding * scale;
-        const copyStartY = srcY === 0 ? 0 : tilePadding * scale;
-        const copyEndX = (srcX + srcW >= inputWidth) ? srcW * scale : srcW * scale - tilePadding * scale;
-        const copyEndY = (srcY + srcH >= inputHeight) ? srcH * scale : srcH * scale - tilePadding * scale;
-        const copyW = copyEndX - copyStartX;
-        const copyH = copyEndY - copyStartY;
-
-        // Put tile on output canvas
-        this.ctx.putImageData(
-          outputImageData,
-          dstX,
-          dstY,
-          copyStartX,
-          copyStartY,
-          copyW,
-          copyH
-        );
-
-        // Cleanup
-        tensor.dispose();
-        output.dispose();
-        tileBitmap.close();
+          // Put tile on output canvas
+          this.ctx.putImageData(
+            outputImageData,
+            dstX,
+            dstY,
+            copyStartX,
+            copyStartY,
+            copyW,
+            copyH
+          );
+        } finally {
+          // Always dispose tensors and close bitmap even if inference fails
+          tensor?.dispose();
+          output?.dispose();
+          tileBitmap.close();
+        }
       }
     }
   }

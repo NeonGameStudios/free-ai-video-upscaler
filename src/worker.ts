@@ -306,30 +306,35 @@ async function initRecording(
 
     // Loop over all frames
     for await (const sample of sink.samples()) {
-      const videoFrame = sample.toVideoFrame();
+      let videoFrame: VideoFrame | null = null;
+      let bitmap: ImageBitmap | null = null;
+      try {
+        videoFrame = sample.toVideoFrame();
 
-      // Create "before" preview (bilinear upscale)
-      const bitmap = await createImageBitmap(videoFrame, {
-        resizeHeight: videoFrame.codedHeight * currentScale,
-        resizeWidth: videoFrame.codedWidth * currentScale
-      });
+        // Create "before" preview (bilinear upscale)
+        bitmap = await createImageBitmap(videoFrame, {
+          resizeHeight: videoFrame.codedHeight * currentScale,
+          resizeWidth: videoFrame.codedWidth * currentScale
+        });
 
-      // Render through upscaler
-      await upscaler.render(videoFrame);
+        // Render through upscaler
+        await upscaler.render(videoFrame);
 
-      // Render the "Before" preview
-      if (ctx) {
-        ctx.transferFromImageBitmap(bitmap);
+        // Render the "Before" preview
+        if (ctx) {
+          ctx.transferFromImageBitmap(bitmap);
+        }
+
+        // Add frame to output video
+        videoSource.add(sample.timestamp, sample.duration);
+
+        reportProgress(sample);
+      } finally {
+        // Always clean up GPU/memory resources even if render() throws
+        bitmap?.close();
+        videoFrame?.close();
+        sample.close();
       }
-
-      // Add frame to output video
-      videoSource.add(sample.timestamp, sample.duration);
-
-      reportProgress(sample);
-
-      // Cleanup
-      videoFrame.close();
-      sample.close();
     }
 
     await output.finalize();
