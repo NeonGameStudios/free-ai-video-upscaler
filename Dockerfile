@@ -13,4 +13,4 @@ COPY . .
 EXPOSE 8080
 
 # Default to dev server
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "serve"]
