@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert Real-ESRGAN and Real-CUGAN PyTorch models to ONNX format for browser inference.
+Convert Real-ESRGAN, Real-CUGAN, and AnimeJaNai models to ONNX format for browser inference.
 
 This script converts models to ONNX format which can be used with ONNX Runtime Web.
 
@@ -9,15 +9,15 @@ Usage:
     python convert_model.py --all
 
 Models:
-    - realesr-animevideov3    (Real-ESRGAN animevideov3, 4x compact)
-    - animejanai-v3-sd        (AnimeJaNai V3 SD, 2x - requires manual .pth)
-    - animejanai-v3-hd        (AnimeJaNai V3 HD, 2x - requires manual .pth)
+    - realesr-animevideov3    (Real-ESRGAN animevideov3, 4x) - ALREADY ON HUGGING FACE
     - realesrgan-anime-fast   (Real-ESRGAN animevideov3, 4x)
     - realesrgan-anime-plus   (Real-ESRGAN anime, 4x)
     - realesrgan-general-fast (Real-ESRGAN general, 4x)
     - realesrgan-general-plus (Real-ESRGAN plus, 4x)
     - realcugan-2x            (Real-CUGAN, 2x with denoising)
     - realcugan-4x            (Real-CUGAN, 4x with denoising)
+    - animejanai-v3-sd        (AnimeJaNai V3 SD, 2x) - REQUIRES MANUAL DOWNLOAD
+    - animejanai-v3-hd        (AnimeJaNai V3 HD, 2x) - REQUIRES MANUAL DOWNLOAD
 
 Requirements:
     pip install torch onnx basicsr realesrgan
@@ -49,23 +49,7 @@ MODELS = {
         'arch': 'SRVGGNetCompact',
         'num_feat': 64,
         'num_conv': 16,
-        'description': 'RealESR AnimeVideo v3 - Compact model optimized for anime videos'
-    },
-    'animejanai-v3-sd': {
-        'url': '',  # Manual download from https://github.com/the-database/mpv-upscale-2x_animejanai/releases
-        'scale': 2,
-        'arch': 'SRVGGNetCompact',
-        'num_feat': 64,
-        'num_conv': 16,
-        'description': 'AnimeJaNai V3 SD - Soft upscaling, faithful to source (requires manual .pth download)'
-    },
-    'animejanai-v3-hd': {
-        'url': '',  # Manual download from https://github.com/the-database/mpv-upscale-2x_animejanai/releases
-        'scale': 2,
-        'arch': 'SRVGGNetCompact',
-        'num_feat': 64,
-        'num_conv': 16,
-        'description': 'AnimeJaNai V3 HD - Sharp upscaling for high quality sources (requires manual .pth download)'
+        'description': 'RealESR AnimeVideo v3 - Optimized for anime videos (NOTE: ONNX already on Hugging Face)'
     },
     'realesrgan-anime-fast': {
         'url': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth',
@@ -112,6 +96,22 @@ MODELS = {
         'arch': 'CUGAN',
         'pro': False,
         'description': 'Real-CUGAN 4x - High quality anime upscaling with denoising'
+    },
+    'animejanai-v3-sd': {
+        'url': None,  # Must be manually downloaded from AnimeJaNai releases
+        'scale': 2,
+        'arch': 'SRVGGNetCompact',
+        'num_feat': 64,
+        'num_conv': 16,
+        'description': 'AnimeJaNai V3 SD - Soft upscaling (download .pth from https://github.com/the-database/mpv-upscale-2x_animejanai/releases)'
+    },
+    'animejanai-v3-hd': {
+        'url': None,  # Must be manually downloaded from AnimeJaNai releases
+        'scale': 2,
+        'arch': 'SRVGGNetCompact',
+        'num_feat': 64,
+        'num_conv': 16,
+        'description': 'AnimeJaNai V3 HD - Sharp upscaling (download .pth from https://github.com/the-database/mpv-upscale-2x_animejanai/releases)'
     }
 }
 
@@ -124,12 +124,12 @@ def download_model(model_name: str, output_dir: str = 'models') -> str:
     pth_path = os.path.join(output_dir, f'{model_name}.pth')
 
     if not os.path.exists(pth_path):
-        if not model_info['url']:
-            raise FileNotFoundError(
-                f"No download URL for '{model_name}'. "
-                f"Please manually place the .pth file at: {pth_path}\n"
-                f"  Hint: {model_info['description']}"
-            )
+        if model_info['url'] is None:
+            print(f"ERROR: {model_name} requires manual download.")
+            print(f"  {model_info['description']}")
+            print(f"  Place the .pth file at: {pth_path}")
+            raise FileNotFoundError(f"Model file not found: {pth_path}")
+
         print(f"Downloading {model_name}...")
         print(f"  From: {model_info['url']}")
         urllib.request.urlretrieve(model_info['url'], pth_path)

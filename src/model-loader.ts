@@ -18,11 +18,12 @@ const MODEL_URLS: Record<ModelType, string> = {
   // RealESR AnimeVideo v3 - compact model optimized for anime videos
   // Uses lightweight 4B32F architecture from xiongjie's repo
   'realesr-animevideov3': 'https://huggingface.co/xiongjie/lightweight-real-ESRGAN-anime/resolve/main/RealESRGAN_x4plus_anime_4B32F.onnx',
-  // AnimeJaNai V3 models - placeholder URLs (need to be hosted)
-  // Download from: https://github.com/the-database/mpv-upscale-2x_animejanai/releases
-  // Convert .pth to .onnx using chaiNNer, then host on Hugging Face
-  'animejanai-v3-sd': '',
-  'animejanai-v3-hd': '',
+  // AnimeJaNai V3 models - hosted locally in public/models/
+  // Source: https://github.com/the-database/mpv-upscale-2x_animejanai/releases
+  'animejanai-v3-sd': '/models/2x_AnimeJaNai_SD_V1beta34_Compact.onnx',
+  'animejanai-v3-hd': '/models/2x_AnimeJaNai_HD_V3_Compact.onnx',
+  'animejanai-v3-hd-fast': '/models/2x_AnimeJaNai_HD_V3_UltraCompact.onnx',
+  'animejanai-v3-hd-superfast': '/models/2x_AnimeJaNai_HD_V3_SuperUltraCompact.onnx',
   // Real-ESRGAN models - using deepghs/imgutils-models repository
   'realesrgan-anime-fast': 'https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx',
   'realesrgan-anime-plus': 'https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx',
@@ -35,34 +36,20 @@ const MODEL_URLS: Record<ModelType, string> = {
 
 // Model file sizes for progress calculation (approximate, in bytes)
 const MODEL_SIZES: Record<ModelType, number> = {
-  'realesr-animevideov3': 5_160_000,    // ~5.16 MB (compact model)
-  'animejanai-v3-sd': 5_000_000,        // ~5 MB estimated (compact)
-  'animejanai-v3-hd': 5_000_000,        // ~5 MB estimated (compact)
-  'realesrgan-anime-fast': 17_900_000,  // ~17.9 MB
-  'realesrgan-anime-plus': 17_900_000,  // ~17.9 MB
-  'realesrgan-general-fast': 67_100_000, // ~67.1 MB
-  'realesrgan-general-plus': 67_100_000, // ~67.1 MB
-  'realcugan-2x': 20_000_000,  // Estimated ~20 MB
-  'realcugan-4x': 40_000_000,  // Estimated ~40 MB
+  'realesr-animevideov3': 5_160_000,           // ~5.16 MB (compact model)
+  'animejanai-v3-sd': 1_206_372,               // ~1.2 MB (compact)
+  'animejanai-v3-hd': 1_210_839,               // ~1.2 MB (compact)
+  'animejanai-v3-hd-fast': 614_866,            // ~600 KB (ultracompact)
+  'animejanai-v3-hd-superfast': 95_642,        // ~96 KB (superultracompact)
+  'realesrgan-anime-fast': 17_900_000,         // ~17.9 MB
+  'realesrgan-anime-plus': 17_900_000,         // ~17.9 MB
+  'realesrgan-general-fast': 67_100_000,       // ~67.1 MB
+  'realesrgan-general-plus': 67_100_000,       // ~67.1 MB
+  'realcugan-2x': 20_000_000,                  // Estimated ~20 MB
+  'realcugan-4x': 40_000_000,                  // Estimated ~40 MB
 };
 
-// Maximum number of download retry attempts
-const MAX_RETRIES = 3;
-
 export type LoadProgressCallback = (progress: number, message: string) => void;
-
-/**
- * Validate that a buffer contains a valid ONNX model.
- * ONNX uses protobuf format; the first bytes should contain a valid protobuf
- * field tag. A minimal check: the buffer must be non-empty and start with
- * a valid protobuf field header (tag 0x08 for the ir_version field).
- */
-function isValidOnnxModel(data: ArrayBuffer): boolean {
-  if (data.byteLength < 8) return false;
-  const view = new Uint8Array(data);
-  // ONNX protobuf starts with field 1 (ir_version), wire type 0 → tag byte 0x08
-  return view[0] === 0x08;
-}
 
 /**
  * Open the IndexedDB database.
@@ -143,21 +130,43 @@ async function cacheModel(modelId: ModelType, data: ArrayBuffer): Promise<void> 
 }
 
 /**
- * Download a model from URL with progress tracking.
+ * Validate that downloaded data looks like an ONNX model.
+ * ONNX files start with a protobuf header.
+ */
+function validateOnnxData(data: ArrayBuffer): boolean {
+  if (data.byteLength < 8) return false;
+  const view = new Uint8Array(data);
+  // ONNX protobuf typically starts with field tag 0x08 (ir_version)
+  // or 0x12 (producer_name) - check first few bytes are valid protobuf
+  return view[0] === 0x08 || view[0] === 0x12 || view[0] === 0x0a;
+}
+
+/**
+ * Download a model from URL with progress tracking and retry.
  */
 async function downloadModel(
   url: string,
   expectedSize: number,
-  onProgress?: LoadProgressCallback
+  onProgress?: LoadProgressCallback,
+  retryCount: number = 1
 ): Promise<ArrayBuffer> {
-  const response = await fetch(url, {
-    mode: 'cors',
-    credentials: 'omit',
-  });
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    throw new Error(`Failed to download model: ${response.status} ${response.statusText}`);
-  }
+  for (let attempt = 0; attempt <= retryCount; attempt++) {
+    try {
+      if (attempt > 0) {
+        onProgress?.(0, `Retrying download (attempt ${attempt + 1})...`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+
+      const response = await fetch(url, {
+        mode: 'cors',
+        credentials: 'omit',
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to download model: ${response.status} ${response.statusText}`);
+      }
 
   // Try to get content length for progress tracking
   const contentLength = response.headers.get('content-length');
@@ -187,16 +196,28 @@ async function downloadModel(
     onProgress?.(progress, `Downloading: ${formatBytes(receivedLength)} / ${formatBytes(totalSize)}`);
   }
 
-  // Combine chunks into a single ArrayBuffer
-  const buffer = new Uint8Array(receivedLength);
-  let position = 0;
-  for (const chunk of chunks) {
-    buffer.set(chunk, position);
-    position += chunk.length;
+      // Combine chunks into a single ArrayBuffer
+      const buffer = new Uint8Array(receivedLength);
+      let position = 0;
+      for (const chunk of chunks) {
+        buffer.set(chunk, position);
+        position += chunk.length;
+      }
+
+      // Validate the downloaded data
+      if (!validateOnnxData(buffer.buffer)) {
+        throw new Error('Downloaded file does not appear to be a valid ONNX model');
+      }
+
+      onProgress?.(100, 'Download complete');
+      return buffer.buffer;
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt === retryCount) break;
+    }
   }
 
-  onProgress?.(100, 'Download complete');
-  return buffer.buffer;
+  throw lastError || new Error('Download failed after retries');
 }
 
 /**
@@ -209,7 +230,7 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * Evict a single model from the IndexedDB cache.
+ * Evict a cached model from IndexedDB.
  */
 async function evictCachedModel(modelId: ModelType): Promise<void> {
   try {
@@ -218,27 +239,18 @@ async function evictCachedModel(modelId: ModelType): Promise<void> {
       const transaction = db.transaction(STORE_NAME, 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
       const request = store.delete(modelId);
-
-      request.onerror = () => {
-        console.warn('Failed to evict cached model:', request.error);
-        db.close();
-        resolve();
-      };
-
-      request.onsuccess = () => {
-        db.close();
-        resolve();
-      };
+      request.onsuccess = () => { db.close(); resolve(); };
+      request.onerror = () => { db.close(); resolve(); };
     });
-  } catch (e) {
-    console.warn('Failed to evict cached model:', e);
+  } catch {
+    // Ignore eviction errors
   }
 }
 
 /**
  * Load a model by ID, downloading if necessary.
- * Validates ONNX data and retries on corrupt downloads.
  * Returns an ArrayBuffer containing the model data.
+ * If cached data is corrupt, evicts and re-downloads.
  */
 export async function loadModel(
   modelId: ModelType,
@@ -249,12 +261,13 @@ export async function loadModel(
   const cached = await getCachedModel(modelId);
 
   if (cached) {
-    if (isValidOnnxModel(cached)) {
+    // Validate cached data
+    if (validateOnnxData(cached)) {
       onProgress?.(100, 'Loaded from cache');
       return cached;
     }
-    // Cached data is corrupt — evict and re-download
-    console.warn(`Cached model "${modelId}" is corrupt, re-downloading...`);
+    // Corrupt cache - evict and re-download
+    console.warn(`Cached model ${modelId} appears corrupt, re-downloading...`);
     await evictCachedModel(modelId);
   }
 
@@ -268,39 +281,15 @@ export async function loadModel(
     );
   }
 
-  // Download the model with retry logic
-  let lastError: Error | null = null;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      onProgress?.(0, attempt > 1 ? `Retrying download (attempt ${attempt}/${MAX_RETRIES})...` : 'Starting download...');
-      const data = await downloadModel(url, MODEL_SIZES[modelId], onProgress);
+  // Download the model
+  onProgress?.(0, 'Starting download...');
+  const data = await downloadModel(url, MODEL_SIZES[modelId], onProgress);
 
-      // Validate the downloaded data
-      if (!isValidOnnxModel(data)) {
-        throw new Error('Downloaded file is not a valid ONNX model');
-      }
+  // Cache for future use
+  onProgress?.(100, 'Caching model...');
+  await cacheModel(modelId, data);
 
-      // Cache for future use
-      onProgress?.(100, 'Caching model...');
-      await cacheModel(modelId, data);
-
-      return data;
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn(`Download attempt ${attempt}/${MAX_RETRIES} failed for "${modelId}":`, lastError.message);
-
-      if (attempt < MAX_RETRIES) {
-        // Exponential backoff: 1s, 2s, 4s
-        const delay = 1000 * Math.pow(2, attempt - 1);
-        onProgress?.(0, `Download failed, retrying in ${delay / 1000}s...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  }
-
-  throw new Error(
-    `Failed to download model "${modelId}" after ${MAX_RETRIES} attempts: ${lastError?.message}`
-  );
+  return data;
 }
 
 /**

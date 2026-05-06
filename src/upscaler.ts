@@ -295,14 +295,16 @@ export class Upscaler {
 
     // For small images, process in one go
     if (inputWidth <= tileSize && inputHeight <= tileSize) {
-      const { tensor } = await this.preprocess(source);
+      let tensor: ort.Tensor | null = null;
       let output: ort.Tensor | null = null;
       try {
+        const preprocessed = await this.preprocess(source);
+        tensor = preprocessed.tensor;
         output = await this.upscaleTile(tensor);
         const imageData = this.postprocess(output, inputWidth, inputHeight);
         this.ctx.putImageData(imageData, 0, 0);
       } finally {
-        tensor.dispose();
+        tensor?.dispose();
         output?.dispose();
       }
       return;
@@ -319,24 +321,26 @@ export class Upscaler {
 
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
-        // Calculate tile bounds with padding
-        const srcX = Math.max(0, tx * effectiveTileSize - tilePadding);
-        const srcY = Math.max(0, ty * effectiveTileSize - tilePadding);
-        const srcW = Math.min(tileSize, inputWidth - srcX);
-        const srcH = Math.min(tileSize, inputHeight - srcY);
-
-        // Extract tile
-        tileCtx.clearRect(0, 0, tileSize, tileSize);
-        tileCtx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
-
-        // Get tile data
-        const tileImageData = tileCtx.getImageData(0, 0, srcW, srcH);
-        const tileBitmap = await createImageBitmap(tileImageData);
-
-        // Process tile with guaranteed cleanup
+        let tileBitmap: ImageBitmap | null = null;
         let tensor: ort.Tensor | null = null;
         let output: ort.Tensor | null = null;
+
         try {
+          // Calculate tile bounds with padding
+          const srcX = Math.max(0, tx * effectiveTileSize - tilePadding);
+          const srcY = Math.max(0, ty * effectiveTileSize - tilePadding);
+          const srcW = Math.min(tileSize, inputWidth - srcX);
+          const srcH = Math.min(tileSize, inputHeight - srcY);
+
+          // Extract tile
+          tileCtx.clearRect(0, 0, tileSize, tileSize);
+          tileCtx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+
+          // Get tile data
+          const tileImageData = tileCtx.getImageData(0, 0, srcW, srcH);
+          tileBitmap = await createImageBitmap(tileImageData);
+
+          // Process tile
           const preprocessed = await this.preprocess(tileBitmap);
           tensor = preprocessed.tensor;
           output = await this.upscaleTile(tensor);
@@ -365,10 +369,10 @@ export class Upscaler {
             copyH
           );
         } finally {
-          // Always dispose tensors and close bitmap even if inference fails
+          // Cleanup - always dispose even on error
           tensor?.dispose();
           output?.dispose();
-          tileBitmap.close();
+          tileBitmap?.close();
         }
       }
     }

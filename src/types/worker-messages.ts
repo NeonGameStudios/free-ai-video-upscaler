@@ -15,6 +15,8 @@ export type ModelType =
   | 'realesr-animevideov3'
   | 'animejanai-v3-sd'
   | 'animejanai-v3-hd'
+  | 'animejanai-v3-hd-fast'
+  | 'animejanai-v3-hd-superfast'
   | 'realesrgan-anime-fast'
   | 'realesrgan-anime-plus'
   | 'realesrgan-general-fast'
@@ -38,63 +40,77 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     name: 'RealESR AnimeVideo v3',
     description: 'Optimized for anime videos (4x) - Recommended',
     scale: 4,
-    supportsDenoising: false,
+    supportsDenoising: false
   },
   {
     id: 'animejanai-v3-sd',
     name: 'AnimeJaNai V3 - SD',
     description: 'Soft upscaling, faithful to source (2x)',
     scale: 2,
-    supportsDenoising: false,
+    supportsDenoising: false
   },
   {
     id: 'animejanai-v3-hd',
     name: 'AnimeJaNai V3 - HD',
     description: 'Sharp upscaling for high quality sources (2x)',
     scale: 2,
-    supportsDenoising: false,
+    supportsDenoising: false
+  },
+  {
+    id: 'animejanai-v3-hd-fast',
+    name: 'AnimeJaNai V3 - HD Fast',
+    description: 'Fast HD upscaling, good balance of speed/quality (2x)',
+    scale: 2,
+    supportsDenoising: false
+  },
+  {
+    id: 'animejanai-v3-hd-superfast',
+    name: 'AnimeJaNai V3 - HD Superfast',
+    description: 'Fastest HD upscaling, lower quality (2x)',
+    scale: 2,
+    supportsDenoising: false
   },
   {
     id: 'realesrgan-anime-fast',
     name: 'Real-ESRGAN Anime Fast',
     description: 'Fast anime upscaling (4x)',
     scale: 4,
-    supportsDenoising: false,
+    supportsDenoising: false
   },
   {
     id: 'realesrgan-anime-plus',
     name: 'Real-ESRGAN Anime Plus',
     description: 'High quality anime upscaling (4x)',
     scale: 4,
-    supportsDenoising: false,
+    supportsDenoising: false
   },
   {
     id: 'realesrgan-general-fast',
     name: 'Real-ESRGAN General Fast',
     description: 'Fast general content upscaling (4x)',
     scale: 4,
-    supportsDenoising: false,
+    supportsDenoising: false
   },
   {
     id: 'realesrgan-general-plus',
     name: 'Real-ESRGAN General Plus',
     description: 'High quality general content upscaling (4x)',
     scale: 4,
-    supportsDenoising: false,
+    supportsDenoising: false
   },
   {
     id: 'realcugan-2x',
     name: 'Real-CUGAN 2x',
     description: 'Conservative anime upscaling with denoising (2x)',
     scale: 2,
-    supportsDenoising: true,
+    supportsDenoising: true
   },
   {
     id: 'realcugan-4x',
     name: 'Real-CUGAN 4x',
     description: 'High quality anime upscaling with denoising (4x)',
     scale: 4,
-    supportsDenoising: true,
+    supportsDenoising: true
   }
 ];
 
