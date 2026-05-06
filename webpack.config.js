@@ -95,6 +95,7 @@ module.exports = {
             directory: path.join(__dirname, 'dist'),
         },
         compress: true,
+        host: '0.0.0.0',  // Listen on all interfaces (required for Docker)
         port: 8080,
         allowedHosts: "all",
         // Required for WebGPU - must use HTTPS
