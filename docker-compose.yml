@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount source for hot reloading
+      - ./src:/app/src
+      - ./public:/app/public
+    environment:
+      - NODE_ENV=development

@@ -54,6 +54,19 @@ npm run build
 # Output is in dist/
 ```
 
+### Docker (Alternative)
+
+```bash
+# Build and run with Docker Compose
+docker compose up
+
+# Or build manually
+docker build -t video-upscaler .
+docker run -p 8080:8080 video-upscaler
+```
+
+The dev server runs at `http://localhost:8080`. Open in Chrome/Safari to use WebGPU acceleration on M-series Macs.
+
 ### Browser Requirements
 
 - **Recommended**: Chrome/Edge with WebGPU support (best performance)
