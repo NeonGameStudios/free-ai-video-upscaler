@@ -192,7 +192,12 @@
                         @change="onModelChange($event.target.value)"
                     >
                         <template x-for="model in $store.models" :key="model.id">
-                            <option :value="model.id" x-text="model.available ? model.name : model.name + ' (Coming Soon)'" :selected="model.id === $store.selectedModel" :disabled="!model.available"></option>
+                            <option
+                                :value="model.id"
+                                :selected="model.id === $store.selectedModel"
+                                :disabled="!model.available"
+                                x-text="model.available ? model.name : model.name + ' (Coming Soon)'"
+                            ></option>
                         </template>
                     </select>
                     <template x-for="model in $store.models" :key="model.id">

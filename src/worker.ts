@@ -92,20 +92,23 @@ async function init(config: InitData): Promise<void> {
     postMessage({ cmd: 'modelLoaded' } satisfies WorkerResponseMessage);
 
     // Render preview frame
-    const bitmap = await createImageBitmap(config.bitmap, {
-      resizeHeight: resolution.height * currentScale,
-      resizeWidth: resolution.width * currentScale,
-    });
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(config.bitmap, {
+        resizeHeight: resolution.height * currentScale,
+        resizeWidth: resolution.width * currentScale,
+      });
 
-    // Render the upscaled preview
-    await upscaler.render(config.bitmap);
+      // Render the upscaled preview
+      await upscaler.render(config.bitmap);
 
-    // Render the "before" preview (bilinear upscale)
-    if (ctx) {
-      ctx.transferFromImageBitmap(bitmap);
+      // Render the "before" preview (bilinear upscale)
+      if (ctx) {
+        ctx.transferFromImageBitmap(bitmap);
+      }
+    } finally {
+      bitmap?.close();
     }
-
-    bitmap.close();
   } catch (e) {
     console.error('Failed to initialize upscaler:', e);
     postMessage({
@@ -154,18 +157,21 @@ async function switchModel(data: SwitchModelData): Promise<void> {
     postMessage({ cmd: 'modelLoaded' } satisfies WorkerResponseMessage);
 
     // Render preview with new model
-    const bitmap = await createImageBitmap(data.bitmap, {
-      resizeHeight: resolution.height * currentScale,
-      resizeWidth: resolution.width * currentScale,
-    });
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(data.bitmap, {
+        resizeHeight: resolution.height * currentScale,
+        resizeWidth: resolution.width * currentScale,
+      });
 
-    await upscaler.render(data.bitmap);
+      await upscaler.render(data.bitmap);
 
-    if (ctx) {
-      ctx.transferFromImageBitmap(bitmap);
+      if (ctx) {
+        ctx.transferFromImageBitmap(bitmap);
+      }
+    } finally {
+      bitmap?.close();
     }
-
-    bitmap.close();
   } catch (e) {
     console.error('Failed to switch model:', e);
     postMessage({
@@ -330,9 +336,9 @@ async function initRecording(
 
         reportProgress(sample);
       } finally {
-        // Always clean up GPU/memory resources even if render() throws
-        bitmap?.close();
+        // Cleanup - always close resources even on error
         videoFrame?.close();
+        bitmap?.close();
         sample.close();
       }
     }

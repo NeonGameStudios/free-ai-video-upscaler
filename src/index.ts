@@ -15,17 +15,26 @@ import {
   getFormatInfo,
   getResolutionPreset,
 } from './types/worker-messages';
-import { isModelAvailable } from './model-loader';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
   ModelType,
-  ModelInfo,
   DenoiseLevel,
   OutputFormat,
   OutputResolution,
   ModelConfig,
 } from './types/worker-messages';
+import { isModelAvailable } from './model-loader';
+
+// Extended model info with availability status for UI
+interface ModelInfoWithAvailability {
+  id: ModelType;
+  name: string;
+  description: string;
+  scale: number;
+  supportsDenoising: boolean;
+  available: boolean;
+}
 
 import 'bootstrap';
 import 'bootstrap/dist/css/bootstrap.min.css';
@@ -76,11 +85,14 @@ document.addEventListener("DOMContentLoaded", index);
 async function index(): Promise<void> {
     Alpine.store('state', 'init');
 
+    // Add availability status to models for UI
+    const modelsWithAvailability: ModelInfoWithAvailability[] = AVAILABLE_MODELS.map(model => ({
+        ...model,
+        available: isModelAvailable(model.id)
+    }));
+
     // Initialize settings stores
-    Alpine.store('models', AVAILABLE_MODELS.map(m => ({
-        ...m,
-        available: isModelAvailable(m.id),
-    })));
+    Alpine.store('models', modelsWithAvailability);
     Alpine.store('formats', OUTPUT_FORMATS);
     Alpine.store('resolutions', RESOLUTION_PRESETS);
 
@@ -151,9 +163,9 @@ async function onModelChange(modelId: string): Promise<void> {
     const modelInfo = getModelInfo(modelId as ModelType);
     if (!modelInfo) return;
 
-    // Reject unavailable models
+    // Reject selection of unavailable models
     if (!isModelAvailable(modelId as ModelType)) {
-        console.warn(`Model "${modelId}" is not yet available for download.`);
+        Alpine.store('selectedModel', currentModel); // Reset to previous
         return;
     }
 
