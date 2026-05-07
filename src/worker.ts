@@ -39,6 +39,7 @@ let original_canvas: OffscreenCanvas;
 let resolution: Resolution;
 let ctx: ImageBitmapRenderingContext | null;
 let currentScale: number = 4;
+let isModelSwitching: boolean = false;
 
 /**
  * Check if WebGPU is supported in this environment.
@@ -130,6 +131,14 @@ async function switchModel(data: SwitchModelData): Promise<void> {
     return;
   }
 
+  // Prevent concurrent model switches
+  if (isModelSwitching) {
+    console.log('Model switch already in progress, ignoring request');
+    return;
+  }
+
+  isModelSwitching = true;
+
   try {
     // Update scale
     currentScale = data.modelConfig.scale;
@@ -178,6 +187,8 @@ async function switchModel(data: SwitchModelData): Promise<void> {
       cmd: 'error',
       data: `Failed to switch model: ${e}`
     } satisfies WorkerResponseMessage);
+  } finally {
+    isModelSwitching = false;
   }
 }
 
