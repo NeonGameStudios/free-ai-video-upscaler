@@ -142,7 +142,13 @@ async function chooseFile(e?: Event): Promise<void> {
         const [fileHandle] = await window.showOpenFilePicker({
             types: [{
                 description: 'Video Files',
-                accept: { 'video/mp4': ['.mp4'] }
+                accept: {
+                    'video/mp4': ['.mp4', '.m4v'],
+                    'video/webm': ['.webm'],
+                    'video/quicktime': ['.mov'],
+                    'video/x-msvideo': ['.avi'],
+                    'video/x-matroska': ['.mkv']
+                }
             }],
             multiple: false
         });
