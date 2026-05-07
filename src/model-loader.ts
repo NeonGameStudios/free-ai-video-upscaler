@@ -27,8 +27,9 @@ const MODEL_URLS: Record<ModelType, string> = {
   // Real-ESRGAN models - using deepghs/imgutils-models repository
   'realesrgan-anime-fast': 'https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx',
   'realesrgan-anime-plus': 'https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx',
-  'realesrgan-general-fast': 'https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/Real-ESRGAN-x4plus.onnx',
-  'realesrgan-general-plus': 'https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/Real-ESRGAN-x4plus.onnx',
+  // Real-ESRGAN general models - need to be converted and hosted (Qualcomm removed theirs)
+  'realesrgan-general-fast': '',
+  'realesrgan-general-plus': '',
   // Real-CUGAN models - placeholder URLs (need to be converted and hosted)
   'realcugan-2x': '',
   'realcugan-4x': '',
