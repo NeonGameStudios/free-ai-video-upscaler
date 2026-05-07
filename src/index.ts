@@ -83,6 +83,10 @@ document.addEventListener("DOMContentLoaded", index);
  * Main initialization function called on page load.
  */
 async function index(): Promise<void> {
+    // Expose functions to window immediately for onclick handlers
+    window.initRecording = initRecording;
+    window.chooseFile = chooseFile;
+
     Alpine.store('state', 'init');
 
     // Add availability status to models for UI
@@ -539,6 +543,7 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
  * Start the video upscaling process.
  */
 async function initRecording(): Promise<void> {
+    console.log('initRecording called');
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Preparing to process...');
 
