@@ -13,8 +13,8 @@ You can get started at [Free AI Video Upscaler](https://free.upscaler.video/)
 | RealESR AnimeVideo v3 | 4x | Anime | Compact, fast anime video upscaling (default) |
 | Real-ESRGAN Anime Fast | 4x | Anime | Fast anime upscaling |
 | Real-ESRGAN Anime Plus | 4x | Anime | High quality anime upscaling |
-| Real-ESRGAN General Fast | 4x | General | Fast general content upscaling |
-| Real-ESRGAN General Plus | 4x | General | High quality general content upscaling |
+| Real-ESRGAN General Fast | 4x | General | Fast general content upscaling (coming soon) |
+| Real-ESRGAN General Plus | 4x | General | High quality general content upscaling (coming soon) |
 | AnimeJaNai V3 - SD | 2x | Anime | Soft upscaling, faithful to source |
 | AnimeJaNai V3 - HD | 2x | Anime | Sharp upscaling for high quality sources |
 | AnimeJaNai V3 - HD Fast | 2x | Anime | Fast HD upscaling, good speed/quality balance |

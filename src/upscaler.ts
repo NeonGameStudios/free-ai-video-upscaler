@@ -149,15 +149,19 @@ export class Upscaler {
     // Check WebGPU support
     this.useWebGPU = await Upscaler.isWebGPUSupported();
 
+    // AnimeJaNai models use float16 which has issues with WebGPU, use WASM
+    const isAnimeJaNai = this.config.modelId.includes('animejanai');
+    const useWebGPUForModel = this.useWebGPU && !isAnimeJaNai;
+
     // Create session options
     const sessionOptions: ort.InferenceSession.SessionOptions = {
-      executionProviders: this.useWebGPU
+      executionProviders: useWebGPUForModel
         ? ['webgpu', 'wasm']
         : ['wasm'],
       graphOptimizationLevel: 'all',
     };
 
-    console.log(`Creating inference session (WebGPU: ${this.useWebGPU})...`);
+    console.log(`Creating inference session (WebGPU: ${useWebGPUForModel})...`);
     console.log(`Loading model: ${this.config.modelId}`);
 
     try {

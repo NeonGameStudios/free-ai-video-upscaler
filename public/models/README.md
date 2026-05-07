@@ -13,8 +13,8 @@ This directory contains ONNX model files for video upscaling. Models are auto-do
 | `animejanai-v3-hd-superfast` | AnimeJaNai V3 - HD Superfast | 2x | ✅ Local | Fastest HD, smallest model |
 | `realesrgan-anime-fast` | Real-ESRGAN Anime Fast | 4x | ✅ Auto-download | Fast anime upscaling |
 | `realesrgan-anime-plus` | Real-ESRGAN Anime Plus | 4x | ✅ Auto-download | High quality anime upscaling |
-| `realesrgan-general-fast` | Real-ESRGAN General Fast | 4x | ✅ Auto-download | Fast general content upscaling |
-| `realesrgan-general-plus` | Real-ESRGAN General Plus | 4x | ✅ Auto-download | High quality general upscaling |
+| `realesrgan-general-fast` | Real-ESRGAN General Fast | 4x | ⏳ Coming Soon | Fast general content upscaling |
+| `realesrgan-general-plus` | Real-ESRGAN General Plus | 4x | ⏳ Coming Soon | High quality general upscaling |
 | `realcugan-2x` | Real-CUGAN 2x | 2x | ⏳ Coming Soon | Conservative anime with denoising |
 | `realcugan-4x` | Real-CUGAN 4x | 4x | ⏳ Coming Soon | High quality anime with denoising |
 
