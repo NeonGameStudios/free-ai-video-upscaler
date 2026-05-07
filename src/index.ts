@@ -544,6 +544,12 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
  */
 async function initRecording(): Promise<void> {
     console.log('initRecording called');
+
+    if (!video || !video.videoWidth) {
+        console.error('Video not loaded yet');
+        return;
+    }
+
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Preparing to process...');
 
