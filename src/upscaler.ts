@@ -11,6 +11,57 @@ import * as ort from 'onnxruntime-web';
 import type { DenoiseLevel, ModelType } from './types/worker-messages';
 import { loadModel, type LoadProgressCallback } from './model-loader';
 
+/**
+ * Convert a float32 value to float16 (IEEE 754 half-precision).
+ */
+function floatToFloat16(value: number): number {
+  const floatView = new Float32Array(1);
+  const int32View = new Int32Array(floatView.buffer);
+  floatView[0] = value;
+  const x = int32View[0];
+
+  let bits = (x >> 16) & 0x8000; // sign
+  let m = (x >> 12) & 0x07ff;    // mantissa
+  const e = (x >> 23) & 0xff;    // exponent
+
+  if (e < 103) {
+    return bits; // too small, return signed zero
+  }
+
+  if (e > 142) {
+    bits |= 0x7c00; // infinity or NaN
+    bits |= ((e === 255) ? 0 : 1) && (x & 0x007fffff);
+    return bits;
+  }
+
+  if (e < 113) {
+    m |= 0x0800;
+    bits |= (m >> (114 - e)) + ((m >> (113 - e)) & 1);
+    return bits;
+  }
+
+  bits |= ((e - 112) << 10) | (m >> 1);
+  bits += m & 1;
+  return bits;
+}
+
+/**
+ * Convert a float16 value to float32.
+ */
+function float16ToFloat(h: number): number {
+  const s = (h & 0x8000) >> 15;
+  const e = (h & 0x7c00) >> 10;
+  const f = h & 0x03ff;
+
+  if (e === 0) {
+    return (s ? -1 : 1) * Math.pow(2, -14) * (f / Math.pow(2, 10));
+  } else if (e === 0x1f) {
+    return f ? NaN : ((s ? -1 : 1) * Infinity);
+  }
+
+  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / Math.pow(2, 10));
+}
+
 export interface UpscalerConfig {
   modelId: ModelType;
   scale: number;
@@ -38,6 +89,7 @@ export class Upscaler {
   private ctx: OffscreenCanvasRenderingContext2D | null = null;
   private initialized: boolean = false;
   private useWebGPU: boolean = false;
+  private useFloat16: boolean = false;
 
   constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -124,6 +176,10 @@ export class Upscaler {
       console.log('Model loaded successfully');
       console.log('Input names:', this.session.inputNames);
       console.log('Output names:', this.session.outputNames);
+
+      // AnimeJaNai models use float16 input
+      this.useFloat16 = this.config.modelId.includes('animejanai');
+      console.log('Using float16:', this.useFloat16);
     } catch (e) {
       console.error('Failed to load model:', e);
       throw new Error(`Failed to load upscaling model: ${e}`);
@@ -190,7 +246,7 @@ export class Upscaler {
 
   /**
    * Preprocess an image for model input.
-   * Converts ImageBitmap/VideoFrame to normalized Float32 tensor.
+   * Converts ImageBitmap/VideoFrame to normalized tensor (float32 or float16).
    */
   private async preprocess(
     source: ImageBitmap | VideoFrame
@@ -208,7 +264,7 @@ export class Upscaler {
     const imageData = tempCtx.getImageData(0, 0, width, height);
     const pixels = imageData.data;
 
-    // Convert to Float32 tensor in NCHW format (normalized to 0-1)
+    // Convert to tensor in NCHW format (normalized to 0-1)
     const tensorData = new Float32Array(3 * height * width);
 
     for (let i = 0; i < height * width; i++) {
@@ -218,32 +274,46 @@ export class Upscaler {
       tensorData[2 * height * width + i] = pixels[i * 4 + 2] / 255.0; // B
     }
 
-    const tensor = new ort.Tensor('float32', tensorData, [1, 3, height, width]);
+    let tensor: ort.Tensor;
+    if (this.useFloat16) {
+      // Convert to float16 for AnimeJaNai models
+      const float16Data = new Uint16Array(tensorData.length);
+      for (let i = 0; i < tensorData.length; i++) {
+        float16Data[i] = floatToFloat16(tensorData[i]);
+      }
+      tensor = new ort.Tensor('float16', float16Data, [1, 3, height, width]);
+    } else {
+      tensor = new ort.Tensor('float32', tensorData, [1, 3, height, width]);
+    }
 
     return { tensor, width, height };
   }
 
   /**
    * Postprocess model output to ImageData.
-   * Converts Float32 tensor back to RGBA pixels.
+   * Converts tensor (float32 or float16) back to RGBA pixels.
    */
   private postprocess(
     output: ort.Tensor,
     inputWidth: number,
     inputHeight: number
   ): ImageData {
-    const data = output.data as Float32Array;
     const outputWidth = inputWidth * this.config.scale;
     const outputHeight = inputHeight * this.config.scale;
+
+    // Get values from tensor, converting float16 if needed
+    const getValue = this.useFloat16
+      ? (i: number) => float16ToFloat((output.data as Uint16Array)[i])
+      : (i: number) => (output.data as Float32Array)[i];
 
     // Create output pixel array (RGBA)
     const pixels = new Uint8ClampedArray(outputWidth * outputHeight * 4);
 
     for (let i = 0; i < outputHeight * outputWidth; i++) {
       // Convert from NCHW normalized floats back to RGBA bytes
-      const r = Math.round(Math.max(0, Math.min(1, data[i])) * 255);
-      const g = Math.round(Math.max(0, Math.min(1, data[outputHeight * outputWidth + i])) * 255);
-      const b = Math.round(Math.max(0, Math.min(1, data[2 * outputHeight * outputWidth + i])) * 255);
+      const r = Math.round(Math.max(0, Math.min(1, getValue(i))) * 255);
+      const g = Math.round(Math.max(0, Math.min(1, getValue(outputHeight * outputWidth + i))) * 255);
+      const b = Math.round(Math.max(0, Math.min(1, getValue(2 * outputHeight * outputWidth + i))) * 255);
 
       pixels[i * 4] = r;
       pixels[i * 4 + 1] = g;
