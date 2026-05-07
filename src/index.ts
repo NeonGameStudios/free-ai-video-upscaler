@@ -318,7 +318,9 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
  * Set up the preview UI with before/after comparison.
  */
 async function setupPreview(data: ArrayBuffer): Promise<void> {
+    console.log('setupPreview called, creating video element');
     video = document.createElement('video');
+    console.log('video element created:', video);
 
     const fileBlob = new Blob([data], { type: "video/mp4" });
 
@@ -327,6 +329,7 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
     const imageCompare = document.getElementById('image-compare-outer') as HTMLElement;
 
     video.onloadeddata = async function () {
+        console.log('video.onloadeddata fired, videoWidth:', video.videoWidth);
         Alpine.store('width', video.videoWidth);
         Alpine.store('height', video.videoHeight);
 
