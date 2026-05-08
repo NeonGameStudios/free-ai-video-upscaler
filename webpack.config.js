@@ -69,6 +69,11 @@ module.exports = {
                     from: "public/models",
                     to: "models",
                     noErrorOnMissing: true
+                },
+                // Copy FFmpeg.wasm core files for local hosting
+                {
+                    from: "node_modules/@ffmpeg/core/dist/esm/*",
+                    to: "ffmpeg/[name][ext]"
                 }
             ]
         })

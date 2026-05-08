@@ -20,6 +20,7 @@
   "homepage": "https://github.com/sb2702/free-ai-video-upscaler#readme",
   "dependencies": {
     "@babel/core": "^7.1.6",
+    "@ffmpeg/core": "^0.12.10",
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "@popperjs/core": "^2.11.8",

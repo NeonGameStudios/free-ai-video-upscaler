@@ -32,9 +32,10 @@ async function initFFmpeg(onProgress?: (message: string) => void): Promise<FFmpe
 
   loadPromise = (async () => {
     onProgress?.('Loading FFmpeg...');
+    // Load from local files (copied by webpack) to avoid CORS issues
     await ffmpeg!.load({
-      coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
-      wasmURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
+      coreURL: '/ffmpeg/ffmpeg-core.js',
+      wasmURL: '/ffmpeg/ffmpeg-core.wasm',
     });
   })();
 
