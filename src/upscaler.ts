@@ -75,7 +75,7 @@ const DEFAULT_CONFIG: UpscalerConfig = {
   modelId: 'realesr-animevideov3',
   scale: 4,
   tileSize: 256,
-  tilePadding: 16,
+  tilePadding: 32,
   denoiseLevel: 0,
 };
 
@@ -385,9 +385,11 @@ export class Upscaler {
     }
 
     // Tiled processing for larger images
-    const effectiveTileSize = tileSize - 2 * tilePadding;
-    const tilesX = Math.ceil(inputWidth / effectiveTileSize);
-    const tilesY = Math.ceil(inputHeight / effectiveTileSize);
+    // Use overlap to ensure seamless blending
+    const overlap = tilePadding * 2;  // Total overlap between adjacent tiles
+    const step = tileSize - overlap;   // How far to move between tiles
+    const tilesX = Math.ceil((inputWidth - overlap) / step);
+    const tilesY = Math.ceil((inputHeight - overlap) / step);
 
     // Create temporary canvas for tile extraction
     const tileCanvas = new OffscreenCanvas(tileSize, tileSize);
@@ -400,15 +402,21 @@ export class Upscaler {
         let output: ort.Tensor | null = null;
 
         try {
-          // Calculate tile bounds with padding
-          const srcX = Math.max(0, tx * effectiveTileSize - tilePadding);
-          const srcY = Math.max(0, ty * effectiveTileSize - tilePadding);
-          const srcW = Math.min(tileSize, inputWidth - srcX);
-          const srcH = Math.min(tileSize, inputHeight - srcY);
+          // Calculate source position (where to extract from input)
+          const srcX = tx * step;
+          const srcY = ty * step;
+
+          // Clamp to input boundaries
+          const actualSrcX = Math.min(srcX, inputWidth - tileSize);
+          const actualSrcY = Math.min(srcY, inputHeight - tileSize);
+
+          // Handle small images or last tiles
+          const srcW = Math.min(tileSize, inputWidth - actualSrcX);
+          const srcH = Math.min(tileSize, inputHeight - actualSrcY);
 
           // Extract tile
           tileCtx.clearRect(0, 0, tileSize, tileSize);
-          tileCtx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+          tileCtx.drawImage(source, actualSrcX, actualSrcY, srcW, srcH, 0, 0, srcW, srcH);
 
           // Get tile data
           const tileImageData = tileCtx.getImageData(0, 0, srcW, srcH);
@@ -420,27 +428,38 @@ export class Upscaler {
           output = await this.upscaleTile(tensor);
           const outputImageData = this.postprocess(output, srcW, srcH);
 
-          // Destination position
-          const dstX = tx * effectiveTileSize * scale;
-          const dstY = ty * effectiveTileSize * scale;
+          // Calculate destination position in output
+          const dstX = actualSrcX * scale;
+          const dstY = actualSrcY * scale;
 
-          // Calculate the region to copy (excluding padding on edges)
-          const copyStartX = srcX === 0 ? 0 : tilePadding * scale;
-          const copyStartY = srcY === 0 ? 0 : tilePadding * scale;
-          const copyEndX = (srcX + srcW >= inputWidth) ? srcW * scale : srcW * scale - tilePadding * scale;
-          const copyEndY = (srcY + srcH >= inputHeight) ? srcH * scale : srcH * scale - tilePadding * scale;
-          const copyW = copyEndX - copyStartX;
-          const copyH = copyEndY - copyStartY;
+          // For interior tiles, we only keep the center region (excluding overlap)
+          // For edge tiles, we keep more
+          const isLeftEdge = (actualSrcX === 0);
+          const isTopEdge = (actualSrcY === 0);
+          const isRightEdge = (actualSrcX + srcW >= inputWidth);
+          const isBottomEdge = (actualSrcY + srcH >= inputHeight);
+
+          // Calculate which region of the output tile to keep
+          const keepStartX = isLeftEdge ? 0 : tilePadding * scale;
+          const keepStartY = isTopEdge ? 0 : tilePadding * scale;
+          const keepEndX = isRightEdge ? srcW * scale : (srcW - tilePadding) * scale;
+          const keepEndY = isBottomEdge ? srcH * scale : (srcH - tilePadding) * scale;
+          const keepW = keepEndX - keepStartX;
+          const keepH = keepEndY - keepStartY;
+
+          // Adjust destination to account for the region we're keeping
+          const finalDstX = dstX + keepStartX;
+          const finalDstY = dstY + keepStartY;
 
           // Put tile on output canvas
           this.ctx.putImageData(
             outputImageData,
-            dstX,
-            dstY,
-            copyStartX,
-            copyStartY,
-            copyW,
-            copyH
+            finalDstX,
+            finalDstY,
+            keepStartX,
+            keepStartY,
+            keepW,
+            keepH
           );
         } finally {
           // Cleanup - always dispose even on error

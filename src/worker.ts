@@ -18,6 +18,8 @@ import {
   VideoSample,
   VideoSampleSink,
   WebMOutputFormat,
+  AudioSampleSink,
+  AudioSampleSource,
 } from 'mediabunny';
 
 import { Upscaler } from './upscaler';
@@ -294,6 +296,23 @@ async function initRecording(
     });
 
     output.addVideoTrack(videoSource, { frameRate: 30 });
+
+    // Set up audio passthrough
+    const audioTrack = await input.getPrimaryAudioTrack();
+    let audioSink: AudioSampleSink | null = null;
+    let audioSource: AudioSampleSource | null = null;
+
+    if (audioTrack) {
+      // Create audio source with AAC codec for MP4 compatibility
+      const audioCodec = settings.outputFormat === 'webm' ? 'opus' : 'aac';
+      audioSource = new AudioSampleSource({
+        codec: audioCodec,
+        bitrate: 128000,
+      });
+      output.addAudioTrack(audioSource);
+      audioSink = new AudioSampleSink(audioTrack);
+    }
+
     await output.start();
 
     const videoTrack = await input.getPrimaryVideoTrack();
@@ -315,9 +334,12 @@ async function initRecording(
       return;
     }
 
-    const sink = new VideoSampleSink(videoTrack);
+    const videoSink = new VideoSampleSink(videoTrack);
     const duration = await input.computeDuration();
     const start_time = performance.now();
+
+    // Track audio progress separately
+    let lastAudioTimestamp = 0;
 
     function reportProgress(sample: VideoSample) {
       const time_elapsed = performance.now() - start_time;
@@ -334,11 +356,26 @@ async function initRecording(
       }
     }
 
+    // Process audio up to a given timestamp
+    async function processAudioUpTo(timestamp: number) {
+      if (!audioSink || !audioSource) return;
+
+      // Get audio samples up to this video frame's timestamp
+      for await (const audioSample of audioSink.samples(lastAudioTimestamp, timestamp)) {
+        await audioSource.add(audioSample);
+        lastAudioTimestamp = audioSample.timestamp + audioSample.duration;
+        audioSample.close();
+      }
+    }
+
     // Loop over all frames
-    for await (const sample of sink.samples()) {
+    for await (const sample of videoSink.samples()) {
       let videoFrame: VideoFrame | null = null;
       let bitmap: ImageBitmap | null = null;
       try {
+        // Process audio up to this frame's timestamp
+        await processAudioUpTo(sample.timestamp + sample.duration);
+
         videoFrame = sample.toVideoFrame();
 
         // Create "before" preview (bilinear upscale)
@@ -366,6 +403,9 @@ async function initRecording(
         sample.close();
       }
     }
+
+    // Process any remaining audio
+    await processAudioUpTo(duration);
 
     await output.finalize();
 

@@ -246,8 +246,8 @@ function getModelConfig(): ModelConfig {
     return {
         modelId: currentModel,
         scale: modelInfo?.scale || 4,
-        tileSize: 256,
-        tilePadding: 16,
+        tileSize: 512,
+        tilePadding: 32,
         denoiseLevel: modelInfo?.supportsDenoising ? currentDenoiseLevel : undefined,
     };
 }
