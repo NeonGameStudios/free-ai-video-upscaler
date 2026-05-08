@@ -182,7 +182,7 @@ export type WorkerRequestMessage =
   | { cmd: 'isSupported' }
   | { cmd: 'init'; data: InitData }
   | { cmd: 'switchModel'; data: SwitchModelData }
-  | { cmd: 'process'; inputHandle: FileSystemFileHandle; outputHandle?: FileSystemFileHandle; settings: ProcessSettings };
+  | { cmd: 'process'; inputHandle?: FileSystemFileHandle; inputFile?: File; outputHandle?: FileSystemFileHandle; settings: ProcessSettings };
 
 export interface InitData {
   bitmap: ImageBitmap;

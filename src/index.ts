@@ -59,7 +59,8 @@ let currentOutputResolution: OutputResolution = 'auto';
 
 // Video data
 let download_name: string;
-let inputFileHandle: FileSystemFileHandle;
+let inputFileHandle: FileSystemFileHandle | null = null;
+let inputFile: File | null = null;  // Used for remuxed MKV files
 
 // Declare global window functions for Alpine to call and File System Access API
 declare global {
@@ -317,13 +318,10 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
                 Alpine.store('loading_message', message);
             });
 
-            // Create a new file handle for the remuxed content
-            // We'll use a virtual handle that wraps the ArrayBuffer
+            // Store remuxed file directly (can't use virtual FileSystemFileHandle with postMessage)
             const mp4Blob = new Blob([arrayBuffer], { type: 'video/mp4' });
-            const mp4File = new File([mp4Blob], getBaseName(originalFilename) + '.mp4', { type: 'video/mp4' });
-
-            // Create a virtual file handle for the remuxed file
-            inputFileHandle = await createVirtualFileHandle(mp4File);
+            inputFile = new File([mp4Blob], getBaseName(originalFilename) + '.mp4', { type: 'video/mp4' });
+            inputFileHandle = null;  // No handle for remuxed files
         } catch (e) {
             console.error('Remux failed:', e);
             showError(`Failed to convert MKV: ${e}`);
@@ -332,32 +330,12 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     } else {
         // Store the original file handle for processing
         inputFileHandle = fileHandle;
+        inputFile = null;
         arrayBuffer = await file.arrayBuffer();
     }
 
     updateDownloadName();
     await setupPreview(arrayBuffer);
-}
-
-/**
- * Create a virtual FileSystemFileHandle from a File object.
- * Used for remuxed files that don't exist on disk.
- */
-async function createVirtualFileHandle(file: File): Promise<FileSystemFileHandle> {
-    return {
-        kind: 'file',
-        name: file.name,
-        getFile: async () => file,
-        createWritable: async () => {
-            throw new Error('Virtual file handle does not support writing');
-        },
-        createSyncAccessHandle: async () => {
-            throw new Error('Virtual file handle does not support sync access');
-        },
-        isSameEntry: async () => false,
-        queryPermission: async () => 'granted' as PermissionState,
-        requestPermission: async () => 'granted' as PermissionState,
-    } as unknown as FileSystemFileHandle;
 }
 
 /**
@@ -619,16 +597,20 @@ async function initRecording(): Promise<void> {
 
     const resPreset = getResolutionPreset(currentOutputResolution);
 
-    worker.postMessage({
+    // Pass either inputHandle (for regular files) or inputFile (for remuxed MKV)
+    const message: WorkerRequestMessage = {
         cmd: "process",
-        inputHandle: inputFileHandle,
+        inputHandle: inputFileHandle || undefined,
+        inputFile: inputFile || undefined,
         outputHandle,
         settings: {
             outputFormat: currentOutputFormat,
             outputResolution: currentOutputResolution,
             targetHeight: resPreset?.maxHeight || undefined,
         }
-    } satisfies WorkerRequestMessage);
+    };
+
+    worker.postMessage(message);
 }
 
 /**

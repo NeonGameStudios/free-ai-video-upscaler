@@ -233,9 +233,11 @@ function getMimeType(format: OutputFormat): string {
 
 /**
  * Main video processing function.
+ * Accepts either inputHandle (FileSystemFileHandle) or inputFile (File) for remuxed MKV files.
  */
 async function initRecording(
-  inputHandle: FileSystemFileHandle,
+  inputHandle: FileSystemFileHandle | undefined,
+  inputFile: File | undefined,
   outputHandle: FileSystemFileHandle | undefined,
   settings: ProcessSettings
 ): Promise<void> {
@@ -248,8 +250,19 @@ async function initRecording(
   }
 
   try {
-    // Get the file from the handle
-    const file = await inputHandle.getFile();
+    // Get the file from handle or use provided file directly (for remuxed MKV)
+    let file: File;
+    if (inputFile) {
+      file = inputFile;
+    } else if (inputHandle) {
+      file = await inputHandle.getFile();
+    } else {
+      postMessage({
+        cmd: 'error',
+        data: 'No input file provided'
+      } satisfies WorkerResponseMessage);
+      return;
+    }
 
     // MediaBunny handles streaming from the blob for large files
     const source = new BlobSource(file);
@@ -408,6 +421,7 @@ self.onmessage = async function (event: MessageEvent<WorkerRequestMessage>) {
     case 'process':
       await initRecording(
         event.data.inputHandle,
+        event.data.inputFile,
         event.data.outputHandle,
         event.data.settings
       );
