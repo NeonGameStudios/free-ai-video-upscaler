@@ -83,10 +83,13 @@ module.exports = {
         }
     },
 
-    // Ignore warnings about ONNX Runtime dynamic imports
+    // Ignore warnings about dynamic imports in ONNX Runtime and FFmpeg
     ignoreWarnings: [
         {
             module: /onnxruntime-web/,
+        },
+        {
+            module: /@ffmpeg\/ffmpeg/,
         },
     ],
 
@@ -101,10 +104,16 @@ module.exports = {
         // Required for WebGPU - must use HTTPS
         https: false, // Set to true with certs for production
         headers: {
-            // Required headers for SharedArrayBuffer (needed by ONNX Runtime)
+            // Required headers for SharedArrayBuffer (needed by ONNX Runtime and FFmpeg.wasm)
             "Cross-Origin-Opener-Policy": "same-origin",
             "Cross-Origin-Embedder-Policy": "require-corp"
-        }
+        },
+        client: {
+            overlay: {
+                errors: true,
+                warnings: false,  // Don't show warnings in overlay
+            },
+        },
     },
 
     mode: 'development'
