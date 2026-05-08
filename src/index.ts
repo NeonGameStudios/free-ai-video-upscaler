@@ -25,6 +25,7 @@ import type {
   ModelConfig,
 } from './types/worker-messages';
 import { isModelAvailable } from './model-loader';
+import { needsRemux, remuxToMp4, getBaseName } from './remux';
 
 // Extended model info with availability status for UI
 interface ModelInfoWithAvailability {
@@ -145,10 +146,11 @@ async function chooseFile(e?: Event): Promise<void> {
     try {
         const [fileHandle] = await window.showOpenFilePicker({
             types: [{
-                description: 'Video Files (MP4, WebM)',
+                description: 'Video Files (MP4, WebM, MKV)',
                 accept: {
                     'video/mp4': ['.mp4', '.m4v'],
                     'video/webm': ['.webm'],
+                    'video/x-matroska': ['.mkv'],
                 }
             }],
             multiple: false
@@ -291,24 +293,71 @@ function updateDownloadName(): void {
 
 /**
  * Load video file from FileSystemFileHandle.
+ * Automatically remuxes MKV files to MP4 for browser compatibility.
  */
 async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Loading video...');
 
-    // Store the file handle for later processing
-    inputFileHandle = fileHandle;
-
-    // Get the file to create a preview
+    // Get the file to check format and create preview
     const file = await fileHandle.getFile();
+    const originalFilename = file.name;
 
-    // Set up initial filename
-    Alpine.store('filename', file.name);
+    // Set up initial filename (use base name, will add extension based on output format)
+    Alpine.store('filename', originalFilename);
+
+    let arrayBuffer: ArrayBuffer;
+
+    // Check if file needs remuxing (MKV -> MP4)
+    if (needsRemux(originalFilename)) {
+        Alpine.store('loading_message', 'Converting MKV to MP4...');
+
+        try {
+            arrayBuffer = await remuxToMp4(file, (message) => {
+                Alpine.store('loading_message', message);
+            });
+
+            // Create a new file handle for the remuxed content
+            // We'll use a virtual handle that wraps the ArrayBuffer
+            const mp4Blob = new Blob([arrayBuffer], { type: 'video/mp4' });
+            const mp4File = new File([mp4Blob], getBaseName(originalFilename) + '.mp4', { type: 'video/mp4' });
+
+            // Create a virtual file handle for the remuxed file
+            inputFileHandle = await createVirtualFileHandle(mp4File);
+        } catch (e) {
+            console.error('Remux failed:', e);
+            showError(`Failed to convert MKV: ${e}`);
+            return;
+        }
+    } else {
+        // Store the original file handle for processing
+        inputFileHandle = fileHandle;
+        arrayBuffer = await file.arrayBuffer();
+    }
+
     updateDownloadName();
-
-    // Read file for preview setup
-    const arrayBuffer = await file.arrayBuffer();
     await setupPreview(arrayBuffer);
+}
+
+/**
+ * Create a virtual FileSystemFileHandle from a File object.
+ * Used for remuxed files that don't exist on disk.
+ */
+async function createVirtualFileHandle(file: File): Promise<FileSystemFileHandle> {
+    return {
+        kind: 'file',
+        name: file.name,
+        getFile: async () => file,
+        createWritable: async () => {
+            throw new Error('Virtual file handle does not support writing');
+        },
+        createSyncAccessHandle: async () => {
+            throw new Error('Virtual file handle does not support sync access');
+        },
+        isSameEntry: async () => false,
+        queryPermission: async () => 'granted' as PermissionState,
+        requestPermission: async () => 'granted' as PermissionState,
+    } as unknown as FileSystemFileHandle;
 }
 
 /**
