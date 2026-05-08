@@ -30,12 +30,21 @@ async function initFFmpeg(onProgress?: (message: string) => void): Promise<FFmpe
     console.log('[FFmpeg]', message);
   });
 
+  // Get URLs for FFmpeg core files using webpack's asset handling
+  const coreURL = new URL(
+    '../node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.js',
+    import.meta.url
+  ).href;
+  const wasmURL = new URL(
+    '../node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.wasm',
+    import.meta.url
+  ).href;
+
   loadPromise = (async () => {
     onProgress?.('Loading FFmpeg...');
-    // Load from local files (copied by webpack) to avoid CORS issues
     await ffmpeg!.load({
-      coreURL: '/ffmpeg/ffmpeg-core.js',
-      wasmURL: '/ffmpeg/ffmpeg-core.wasm',
+      coreURL,
+      wasmURL,
     });
   })();
 
