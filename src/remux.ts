@@ -6,10 +6,13 @@
  */
 
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile } from '@ffmpeg/util';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 let ffmpeg: FFmpeg | null = null;
 let loadPromise: Promise<void> | null = null;
+
+// Base URL for FFmpeg core files from unpkg CDN (with CORS support)
+const FFMPEG_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
 
 /**
  * Initialize FFmpeg.wasm (lazy loaded on first use)
@@ -30,18 +33,20 @@ async function initFFmpeg(onProgress?: (message: string) => void): Promise<FFmpe
     console.log('[FFmpeg]', message);
   });
 
-  // Get URLs for FFmpeg core files using webpack's asset handling
-  const coreURL = new URL(
-    '../node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.js',
-    import.meta.url
-  ).href;
-  const wasmURL = new URL(
-    '../node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.wasm',
-    import.meta.url
-  ).href;
-
   loadPromise = (async () => {
-    onProgress?.('Loading FFmpeg...');
+    onProgress?.('Loading FFmpeg (first time may take a moment)...');
+
+    // Use toBlobURL to fetch files and convert to blob URLs
+    // This handles CORS properly by downloading and creating local blob URLs
+    const coreURL = await toBlobURL(
+      `${FFMPEG_BASE_URL}/ffmpeg-core.js`,
+      'text/javascript'
+    );
+    const wasmURL = await toBlobURL(
+      `${FFMPEG_BASE_URL}/ffmpeg-core.wasm`,
+      'application/wasm'
+    );
+
     await ffmpeg!.load({
       coreURL,
       wasmURL,
