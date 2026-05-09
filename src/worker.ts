@@ -371,26 +371,14 @@ async function initRecording(
     // Loop over all frames
     for await (const sample of videoSink.samples()) {
       let videoFrame: VideoFrame | null = null;
-      let bitmap: ImageBitmap | null = null;
       try {
         // Process audio up to this frame's timestamp
         await processAudioUpTo(sample.timestamp + sample.duration);
 
         videoFrame = sample.toVideoFrame();
 
-        // Create "before" preview (bilinear upscale)
-        bitmap = await createImageBitmap(videoFrame, {
-          resizeHeight: videoFrame.codedHeight * currentScale,
-          resizeWidth: videoFrame.codedWidth * currentScale
-        });
-
-        // Render through upscaler
+        // Render through upscaler (skip "before" preview during processing for speed)
         await upscaler.render(videoFrame);
-
-        // Render the "Before" preview
-        if (ctx) {
-          ctx.transferFromImageBitmap(bitmap);
-        }
 
         // Add frame to output video
         videoSource.add(sample.timestamp, sample.duration);
@@ -399,7 +387,6 @@ async function initRecording(
       } finally {
         // Cleanup - always close resources even on error
         videoFrame?.close();
-        bitmap?.close();
         sample.close();
       }
     }

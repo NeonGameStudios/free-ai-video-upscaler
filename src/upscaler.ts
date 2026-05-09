@@ -91,6 +91,10 @@ export class Upscaler {
   private useWebGPU: boolean = false;
   private useFloat16: boolean = false;
 
+  // Reusable canvas for preprocessing (avoid allocation per frame)
+  private preprocessCanvas: OffscreenCanvas | null = null;
+  private preprocessCtx: OffscreenCanvasRenderingContext2D | null = null;
+
   constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
@@ -257,15 +261,17 @@ export class Upscaler {
   ): Promise<{ tensor: ort.Tensor; width: number; height: number }> {
     const { width, height } = this.getSourceDimensions(source);
 
-    // Create temporary canvas for pixel extraction
-    const tempCanvas = new OffscreenCanvas(width, height);
-    const tempCtx = tempCanvas.getContext('2d')!;
+    // Reuse canvas if same size, otherwise create new one
+    if (!this.preprocessCanvas || this.preprocessCanvas.width !== width || this.preprocessCanvas.height !== height) {
+      this.preprocessCanvas = new OffscreenCanvas(width, height);
+      this.preprocessCtx = this.preprocessCanvas.getContext('2d', { willReadFrequently: true })!;
+    }
 
     // Draw source to canvas
-    tempCtx.drawImage(source, 0, 0);
+    this.preprocessCtx!.drawImage(source, 0, 0);
 
     // Get pixel data
-    const imageData = tempCtx.getImageData(0, 0, width, height);
+    const imageData = this.preprocessCtx!.getImageData(0, 0, width, height);
     const pixels = imageData.data;
 
     // Convert to tensor in NCHW format (normalized to 0-1)
