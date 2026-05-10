@@ -18,6 +18,8 @@ import {
   VideoSample,
   VideoSampleSink,
   WebMOutputFormat,
+  AudioSampleSink,
+  AudioSampleSource,
 } from 'mediabunny';
 
 import { Upscaler } from './upscaler';
@@ -39,6 +41,7 @@ let original_canvas: OffscreenCanvas;
 let resolution: Resolution;
 let ctx: ImageBitmapRenderingContext | null;
 let currentScale: number = 4;
+let isModelSwitching: boolean = false;
 
 /**
  * Check if WebGPU is supported in this environment.
@@ -130,6 +133,14 @@ async function switchModel(data: SwitchModelData): Promise<void> {
     return;
   }
 
+  // Prevent concurrent model switches
+  if (isModelSwitching) {
+    console.log('Model switch already in progress, ignoring request');
+    return;
+  }
+
+  isModelSwitching = true;
+
   try {
     // Update scale
     currentScale = data.modelConfig.scale;
@@ -178,6 +189,8 @@ async function switchModel(data: SwitchModelData): Promise<void> {
       cmd: 'error',
       data: `Failed to switch model: ${e}`
     } satisfies WorkerResponseMessage);
+  } finally {
+    isModelSwitching = false;
   }
 }
 
@@ -222,9 +235,11 @@ function getMimeType(format: OutputFormat): string {
 
 /**
  * Main video processing function.
+ * Accepts either inputHandle (FileSystemFileHandle) or inputFile (File) for remuxed MKV files.
  */
 async function initRecording(
-  inputHandle: FileSystemFileHandle,
+  inputHandle: FileSystemFileHandle | undefined,
+  inputFile: File | undefined,
   outputHandle: FileSystemFileHandle | undefined,
   settings: ProcessSettings
 ): Promise<void> {
@@ -237,8 +252,19 @@ async function initRecording(
   }
 
   try {
-    // Get the file from the handle
-    const file = await inputHandle.getFile();
+    // Get the file from handle or use provided file directly (for remuxed MKV)
+    let file: File;
+    if (inputFile) {
+      file = inputFile;
+    } else if (inputHandle) {
+      file = await inputHandle.getFile();
+    } else {
+      postMessage({
+        cmd: 'error',
+        data: 'No input file provided'
+      } satisfies WorkerResponseMessage);
+      return;
+    }
 
     // MediaBunny handles streaming from the blob for large files
     const source = new BlobSource(file);
@@ -270,6 +296,23 @@ async function initRecording(
     });
 
     output.addVideoTrack(videoSource, { frameRate: 30 });
+
+    // Set up audio passthrough
+    const audioTrack = await input.getPrimaryAudioTrack();
+    let audioSink: AudioSampleSink | null = null;
+    let audioSource: AudioSampleSource | null = null;
+
+    if (audioTrack) {
+      // Create audio source with AAC codec for MP4 compatibility
+      const audioCodec = settings.outputFormat === 'webm' ? 'opus' : 'aac';
+      audioSource = new AudioSampleSource({
+        codec: audioCodec,
+        bitrate: 128000,
+      });
+      output.addAudioTrack(audioSource);
+      audioSink = new AudioSampleSink(audioTrack);
+    }
+
     await output.start();
 
     const videoTrack = await input.getPrimaryVideoTrack();
@@ -291,9 +334,12 @@ async function initRecording(
       return;
     }
 
-    const sink = new VideoSampleSink(videoTrack);
+    const videoSink = new VideoSampleSink(videoTrack);
     const duration = await input.computeDuration();
     const start_time = performance.now();
+
+    // Track audio progress separately
+    let lastAudioTimestamp = 0;
 
     function reportProgress(sample: VideoSample) {
       const time_elapsed = performance.now() - start_time;
@@ -310,26 +356,29 @@ async function initRecording(
       }
     }
 
+    // Process audio up to a given timestamp
+    async function processAudioUpTo(timestamp: number) {
+      if (!audioSink || !audioSource) return;
+
+      // Get audio samples up to this video frame's timestamp
+      for await (const audioSample of audioSink.samples(lastAudioTimestamp, timestamp)) {
+        await audioSource.add(audioSample);
+        lastAudioTimestamp = audioSample.timestamp + audioSample.duration;
+        audioSample.close();
+      }
+    }
+
     // Loop over all frames
-    for await (const sample of sink.samples()) {
+    for await (const sample of videoSink.samples()) {
       let videoFrame: VideoFrame | null = null;
-      let bitmap: ImageBitmap | null = null;
       try {
+        // Process audio up to this frame's timestamp
+        await processAudioUpTo(sample.timestamp + sample.duration);
+
         videoFrame = sample.toVideoFrame();
 
-        // Create "before" preview (bilinear upscale)
-        bitmap = await createImageBitmap(videoFrame, {
-          resizeHeight: videoFrame.codedHeight * currentScale,
-          resizeWidth: videoFrame.codedWidth * currentScale
-        });
-
-        // Render through upscaler
+        // Render through upscaler (skip "before" preview during processing for speed)
         await upscaler.render(videoFrame);
-
-        // Render the "Before" preview
-        if (ctx) {
-          ctx.transferFromImageBitmap(bitmap);
-        }
 
         // Add frame to output video
         videoSource.add(sample.timestamp, sample.duration);
@@ -338,10 +387,12 @@ async function initRecording(
       } finally {
         // Cleanup - always close resources even on error
         videoFrame?.close();
-        bitmap?.close();
         sample.close();
       }
     }
+
+    // Process any remaining audio
+    await processAudioUpTo(duration);
 
     await output.finalize();
 
@@ -397,6 +448,7 @@ self.onmessage = async function (event: MessageEvent<WorkerRequestMessage>) {
     case 'process':
       await initRecording(
         event.data.inputHandle,
+        event.data.inputFile,
         event.data.outputHandle,
         event.data.settings
       );

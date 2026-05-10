@@ -25,6 +25,7 @@ import type {
   ModelConfig,
 } from './types/worker-messages';
 import { isModelAvailable } from './model-loader';
+import { needsRemux, remuxToMp4, getBaseName } from './remux';
 
 // Extended model info with availability status for UI
 interface ModelInfoWithAvailability {
@@ -58,7 +59,8 @@ let currentOutputResolution: OutputResolution = 'auto';
 
 // Video data
 let download_name: string;
-let inputFileHandle: FileSystemFileHandle;
+let inputFileHandle: FileSystemFileHandle | null = null;
+let inputFile: File | null = null;  // Used for remuxed MKV files
 
 // Declare global window functions for Alpine to call and File System Access API
 declare global {
@@ -83,6 +85,10 @@ document.addEventListener("DOMContentLoaded", index);
  * Main initialization function called on page load.
  */
 async function index(): Promise<void> {
+    // Expose functions to window immediately for onclick handlers
+    window.initRecording = initRecording;
+    window.chooseFile = chooseFile;
+
     Alpine.store('state', 'init');
 
     // Add availability status to models for UI
@@ -141,13 +147,11 @@ async function chooseFile(e?: Event): Promise<void> {
     try {
         const [fileHandle] = await window.showOpenFilePicker({
             types: [{
-                description: 'Video Files',
+                description: 'Video Files (MP4, WebM, MKV)',
                 accept: {
                     'video/mp4': ['.mp4', '.m4v'],
                     'video/webm': ['.webm'],
-                    'video/quicktime': ['.mov'],
-                    'video/x-msvideo': ['.avi'],
-                    'video/x-matroska': ['.mkv']
+                    'video/x-matroska': ['.mkv'],
                 }
             }],
             multiple: false
@@ -242,8 +246,8 @@ function getModelConfig(): ModelConfig {
     return {
         modelId: currentModel,
         scale: modelInfo?.scale || 4,
-        tileSize: 256,
-        tilePadding: 16,
+        tileSize: 512,
+        tilePadding: 32,
         denoiseLevel: modelInfo?.supportsDenoising ? currentDenoiseLevel : undefined,
     };
 }
@@ -290,23 +294,47 @@ function updateDownloadName(): void {
 
 /**
  * Load video file from FileSystemFileHandle.
+ * Automatically remuxes MKV files to MP4 for browser compatibility.
  */
 async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Loading video...');
 
-    // Store the file handle for later processing
-    inputFileHandle = fileHandle;
-
-    // Get the file to create a preview
+    // Get the file to check format and create preview
     const file = await fileHandle.getFile();
+    const originalFilename = file.name;
 
-    // Set up initial filename
-    Alpine.store('filename', file.name);
+    // Set up initial filename (use base name, will add extension based on output format)
+    Alpine.store('filename', originalFilename);
+
+    let arrayBuffer: ArrayBuffer;
+
+    // Check if file needs remuxing (MKV -> MP4)
+    if (needsRemux(originalFilename)) {
+        Alpine.store('loading_message', 'Converting MKV to MP4...');
+
+        try {
+            arrayBuffer = await remuxToMp4(file, (message) => {
+                Alpine.store('loading_message', message);
+            });
+
+            // Store remuxed file directly (can't use virtual FileSystemFileHandle with postMessage)
+            const mp4Blob = new Blob([arrayBuffer], { type: 'video/mp4' });
+            inputFile = new File([mp4Blob], getBaseName(originalFilename) + '.mp4', { type: 'video/mp4' });
+            inputFileHandle = null;  // No handle for remuxed files
+        } catch (e) {
+            console.error('Remux failed:', e);
+            showError(`Failed to convert MKV: ${e}`);
+            return;
+        }
+    } else {
+        // Store the original file handle for processing
+        inputFileHandle = fileHandle;
+        inputFile = null;
+        arrayBuffer = await file.arrayBuffer();
+    }
+
     updateDownloadName();
-
-    // Read file for preview setup
-    const arrayBuffer = await file.arrayBuffer();
     await setupPreview(arrayBuffer);
 }
 
@@ -314,7 +342,9 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
  * Set up the preview UI with before/after comparison.
  */
 async function setupPreview(data: ArrayBuffer): Promise<void> {
+    console.log('setupPreview called, creating video element');
     video = document.createElement('video');
+    console.log('video element created:', video);
 
     const fileBlob = new Blob([data], { type: "video/mp4" });
 
@@ -323,6 +353,7 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
     const imageCompare = document.getElementById('image-compare-outer') as HTMLElement;
 
     video.onloadeddata = async function () {
+        console.log('video.onloadeddata fired, videoWidth:', video.videoWidth);
         Alpine.store('width', video.videoWidth);
         Alpine.store('height', video.videoHeight);
 
@@ -539,6 +570,13 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
  * Start the video upscaling process.
  */
 async function initRecording(): Promise<void> {
+    console.log('initRecording called');
+
+    if (!video || !video.videoWidth) {
+        console.error('Video not loaded yet');
+        return;
+    }
+
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Preparing to process...');
 
@@ -559,16 +597,20 @@ async function initRecording(): Promise<void> {
 
     const resPreset = getResolutionPreset(currentOutputResolution);
 
-    worker.postMessage({
+    // Pass either inputHandle (for regular files) or inputFile (for remuxed MKV)
+    const message: WorkerRequestMessage = {
         cmd: "process",
-        inputHandle: inputFileHandle,
+        inputHandle: inputFileHandle || undefined,
+        inputFile: inputFile || undefined,
         outputHandle,
         settings: {
             outputFormat: currentOutputFormat,
             outputResolution: currentOutputResolution,
             targetHeight: resPreset?.maxHeight || undefined,
         }
-    } satisfies WorkerRequestMessage);
+    };
+
+    worker.postMessage(message);
 }
 
 /**

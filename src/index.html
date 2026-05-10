@@ -155,13 +155,13 @@
 
 <div id="file-load-panel" class="w-[640px] mx-auto bg-gray-light rounded-3xl h-[360px] p-6 box-border border border-gray-border block" x-show="$store.state === 'init'">
     <p class="w-full text-2xl text-center my-5 mx-auto">Choose a video to upscale</p>
-    <p class="w-full text-sm text-center text-gray-500 mb-4">Supports Real-ESRGAN (anime/general) and Real-CUGAN (with denoising)</p>
+    <p class="w-full text-sm text-center text-gray-500 mb-4">Supports MP4, WebM, and MKV files • Real-ESRGAN &amp; Real-CUGAN models</p>
     <button type="button" class="btn btn-primary mx-auto my-16 py-2 px-4 rounded-lg font-extrabold block bg-blue-900 flex flex-row" id="input-button" onclick="chooseFile(this)">Choose a video file</button>
 </div>
 
 
 
-<div id="start-panel" class="w-[640px] mx-auto bg-gray-light rounded-3xl p-6 box-border border border-gray-border" x-show="$store.state === 'preview' || $store.state === 'processing' || $store.state === 'complete'">
+<div id="start-panel" class="w-[640px] mx-auto bg-gray-light rounded-3xl p-6 box-border border border-gray-border max-h-[90vh] overflow-y-auto" x-show="$store.state === 'preview' || $store.state === 'processing' || $store.state === 'complete'">
 
     <div id="image-compare-outer">
         <div id="image-compare">
@@ -327,7 +327,7 @@
 </div>
 
 
-<div id="footer" class="fixed left-0 bottom-0 w-full text-gray-text text-center text-sm p-5">
+<div id="footer" class="w-full text-gray-text text-center text-sm p-5 mt-16">
     <div class="float-left">
         Source code <a class="text-primary" href="https://github.com/sb2702/free-ai-video-upscaler">on Github</a>. &nbsp; &nbsp; Powered by <a class="text-primary" href="https://github.com/xinntao/Real-ESRGAN">Real-ESRGAN</a> & <a class="text-primary" href="https://github.com/bilibili/ailab/tree/main/Real-CUGAN">Real-CUGAN</a>
     </div>

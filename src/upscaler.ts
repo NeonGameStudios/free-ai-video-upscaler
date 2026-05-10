@@ -10,6 +10,18 @@
 import * as ort from 'onnxruntime-web';
 import type { DenoiseLevel, ModelType } from './types/worker-messages';
 import { loadModel, type LoadProgressCallback } from './model-loader';
+import {
+  WebGPUContext,
+  GPUBufferPool,
+  getORTWebGPUDevice,
+  initWebGPUContext,
+  createBufferPool,
+  runPreprocessShader,
+  runPostprocessShader,
+  importVideoFrame,
+  copyToCanvas,
+  destroyBufferPool,
+} from './webgpu-utils';
 
 /**
  * Convert a float32 value to float16 (IEEE 754 half-precision).
@@ -75,7 +87,7 @@ const DEFAULT_CONFIG: UpscalerConfig = {
   modelId: 'realesr-animevideov3',
   scale: 4,
   tileSize: 256,
-  tilePadding: 16,
+  tilePadding: 32,
   denoiseLevel: 0,
 };
 
@@ -91,8 +103,74 @@ export class Upscaler {
   private useWebGPU: boolean = false;
   private useFloat16: boolean = false;
 
+  // Reusable canvas for preprocessing (avoid allocation per frame)
+  private preprocessCanvas: OffscreenCanvas | null = null;
+  private preprocessCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+  // GPU zero-copy rendering (when available)
+  private gpuContext: WebGPUContext | null = null;
+  private gpuBufferPool: GPUBufferPool | null = null;
+  private useGPUPath: boolean = false;
+  private lastFrameWidth: number = 0;
+  private lastFrameHeight: number = 0;
+
   constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /**
+   * Initialize GPU zero-copy path after ONNX has set up its WebGPU device.
+   */
+  private async initGPUPath(): Promise<boolean> {
+    const device = getORTWebGPUDevice();
+    if (!device) {
+      console.log('WebGPU device not available from ONNX Runtime');
+      return false;
+    }
+
+    try {
+      this.gpuContext = await initWebGPUContext(device);
+      this.useGPUPath = true;
+      console.log('GPU zero-copy path initialized');
+      return true;
+    } catch (e) {
+      console.warn('Failed to initialize GPU path:', e);
+      return false;
+    }
+  }
+
+  /**
+   * Run a warmup inference to trigger ONNX WebGPU device initialization.
+   */
+  private async warmup(): Promise<void> {
+    if (!this.session) return;
+
+    console.log('Running warmup inference...');
+
+    // Create tiny test tensor (16x16)
+    const size = 16;
+    const tensorData = new Float32Array(3 * size * size);
+    let testTensor: ort.Tensor;
+
+    if (this.useFloat16) {
+      const float16Data = new Uint16Array(tensorData.length);
+      for (let i = 0; i < tensorData.length; i++) {
+        float16Data[i] = floatToFloat16(tensorData[i]);
+      }
+      testTensor = new ort.Tensor('float16', float16Data, [1, 3, size, size]);
+    } else {
+      testTensor = new ort.Tensor('float32', tensorData, [1, 3, size, size]);
+    }
+
+    try {
+      const output = await this.upscaleTile(testTensor);
+      output.dispose();
+    } finally {
+      testTensor.dispose();
+    }
+
+    // Now ONNX should have its WebGPU device ready
+    await this.initGPUPath();
   }
 
   /**
@@ -194,6 +272,16 @@ export class Upscaler {
     this.ctx = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
 
     this.initialized = true;
+
+    // Initialize GPU zero-copy path if WebGPU is available
+    if (useWebGPUForModel) {
+      try {
+        await this.warmup();
+      } catch (e) {
+        console.warn('GPU warmup failed, using CPU path:', e);
+        this.useGPUPath = false;
+      }
+    }
   }
 
   /**
@@ -257,15 +345,17 @@ export class Upscaler {
   ): Promise<{ tensor: ort.Tensor; width: number; height: number }> {
     const { width, height } = this.getSourceDimensions(source);
 
-    // Create temporary canvas for pixel extraction
-    const tempCanvas = new OffscreenCanvas(width, height);
-    const tempCtx = tempCanvas.getContext('2d')!;
+    // Reuse canvas if same size, otherwise create new one
+    if (!this.preprocessCanvas || this.preprocessCanvas.width !== width || this.preprocessCanvas.height !== height) {
+      this.preprocessCanvas = new OffscreenCanvas(width, height);
+      this.preprocessCtx = this.preprocessCanvas.getContext('2d', { willReadFrequently: true })!;
+    }
 
     // Draw source to canvas
-    tempCtx.drawImage(source, 0, 0);
+    this.preprocessCtx!.drawImage(source, 0, 0);
 
     // Get pixel data
-    const imageData = tempCtx.getImageData(0, 0, width, height);
+    const imageData = this.preprocessCtx!.getImageData(0, 0, width, height);
     const pixels = imageData.data;
 
     // Convert to tensor in NCHW format (normalized to 0-1)
@@ -385,9 +475,11 @@ export class Upscaler {
     }
 
     // Tiled processing for larger images
-    const effectiveTileSize = tileSize - 2 * tilePadding;
-    const tilesX = Math.ceil(inputWidth / effectiveTileSize);
-    const tilesY = Math.ceil(inputHeight / effectiveTileSize);
+    // Use overlap to ensure seamless blending
+    const overlap = tilePadding * 2;  // Total overlap between adjacent tiles
+    const step = tileSize - overlap;   // How far to move between tiles
+    const tilesX = Math.ceil((inputWidth - overlap) / step);
+    const tilesY = Math.ceil((inputHeight - overlap) / step);
 
     // Create temporary canvas for tile extraction
     const tileCanvas = new OffscreenCanvas(tileSize, tileSize);
@@ -400,15 +492,21 @@ export class Upscaler {
         let output: ort.Tensor | null = null;
 
         try {
-          // Calculate tile bounds with padding
-          const srcX = Math.max(0, tx * effectiveTileSize - tilePadding);
-          const srcY = Math.max(0, ty * effectiveTileSize - tilePadding);
-          const srcW = Math.min(tileSize, inputWidth - srcX);
-          const srcH = Math.min(tileSize, inputHeight - srcY);
+          // Calculate source position (where to extract from input)
+          const srcX = tx * step;
+          const srcY = ty * step;
+
+          // Clamp to input boundaries
+          const actualSrcX = Math.min(srcX, inputWidth - tileSize);
+          const actualSrcY = Math.min(srcY, inputHeight - tileSize);
+
+          // Handle small images or last tiles
+          const srcW = Math.min(tileSize, inputWidth - actualSrcX);
+          const srcH = Math.min(tileSize, inputHeight - actualSrcY);
 
           // Extract tile
           tileCtx.clearRect(0, 0, tileSize, tileSize);
-          tileCtx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+          tileCtx.drawImage(source, actualSrcX, actualSrcY, srcW, srcH, 0, 0, srcW, srcH);
 
           // Get tile data
           const tileImageData = tileCtx.getImageData(0, 0, srcW, srcH);
@@ -420,27 +518,38 @@ export class Upscaler {
           output = await this.upscaleTile(tensor);
           const outputImageData = this.postprocess(output, srcW, srcH);
 
-          // Destination position
-          const dstX = tx * effectiveTileSize * scale;
-          const dstY = ty * effectiveTileSize * scale;
+          // Calculate destination position in output
+          const dstX = actualSrcX * scale;
+          const dstY = actualSrcY * scale;
 
-          // Calculate the region to copy (excluding padding on edges)
-          const copyStartX = srcX === 0 ? 0 : tilePadding * scale;
-          const copyStartY = srcY === 0 ? 0 : tilePadding * scale;
-          const copyEndX = (srcX + srcW >= inputWidth) ? srcW * scale : srcW * scale - tilePadding * scale;
-          const copyEndY = (srcY + srcH >= inputHeight) ? srcH * scale : srcH * scale - tilePadding * scale;
-          const copyW = copyEndX - copyStartX;
-          const copyH = copyEndY - copyStartY;
+          // For interior tiles, we only keep the center region (excluding overlap)
+          // For edge tiles, we keep more
+          const isLeftEdge = (actualSrcX === 0);
+          const isTopEdge = (actualSrcY === 0);
+          const isRightEdge = (actualSrcX + srcW >= inputWidth);
+          const isBottomEdge = (actualSrcY + srcH >= inputHeight);
+
+          // Calculate which region of the output tile to keep
+          const keepStartX = isLeftEdge ? 0 : tilePadding * scale;
+          const keepStartY = isTopEdge ? 0 : tilePadding * scale;
+          const keepEndX = isRightEdge ? srcW * scale : (srcW - tilePadding) * scale;
+          const keepEndY = isBottomEdge ? srcH * scale : (srcH - tilePadding) * scale;
+          const keepW = keepEndX - keepStartX;
+          const keepH = keepEndY - keepStartY;
+
+          // Adjust destination to account for the region we're keeping
+          const finalDstX = dstX + keepStartX;
+          const finalDstY = dstY + keepStartY;
 
           // Put tile on output canvas
           this.ctx.putImageData(
             outputImageData,
-            dstX,
-            dstY,
-            copyStartX,
-            copyStartY,
-            copyW,
-            copyH
+            finalDstX,
+            finalDstY,
+            keepStartX,
+            keepStartY,
+            keepW,
+            keepH
           );
         } finally {
           // Cleanup - always dispose even on error
@@ -453,9 +562,128 @@ export class Upscaler {
   }
 
   /**
+   * Render a frame using GPU zero-copy path.
+   * Eliminates CPU canvas operations by using WebGPU compute shaders.
+   */
+  private async renderGPU(frame: VideoFrame): Promise<void> {
+    if (!this.gpuContext || !this.session || !this.canvas) {
+      throw new Error('GPU path not initialized');
+    }
+
+    const width = frame.codedWidth;
+    const height = frame.codedHeight;
+    const device = this.gpuContext.device;
+    const { scale } = this.config;
+
+    // Create/recreate buffer pool if dimensions changed
+    if (!this.gpuBufferPool ||
+        this.lastFrameWidth !== width ||
+        this.lastFrameHeight !== height) {
+      if (this.gpuBufferPool) {
+        destroyBufferPool(this.gpuBufferPool);
+      }
+      this.gpuBufferPool = createBufferPool(
+        device, width, height, scale, this.useFloat16
+      );
+      this.lastFrameWidth = width;
+      this.lastFrameHeight = height;
+
+      // Resize output canvas
+      this.canvas.width = width * scale;
+      this.canvas.height = height * scale;
+    }
+
+    const pool = this.gpuBufferPool;
+
+    // 1. Import VideoFrame directly to GPU texture (zero-copy on supported browsers)
+    importVideoFrame(device, pool, frame);
+
+    // 2. Run preprocess shader: RGBA texture → NCHW buffer
+    runPreprocessShader(this.gpuContext, pool);
+
+    // 3. Read NCHW buffer back to CPU for ONNX
+    // (Future optimization: use ort.Tensor.fromGpuBuffer if ONNX supports it)
+    const inputBufferSize = 3 * width * height * 4; // float32 = 4 bytes
+    const stagingBuffer = device.createBuffer({
+      size: inputBufferSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    const commandEncoder = device.createCommandEncoder();
+    commandEncoder.copyBufferToBuffer(pool.inputBuffer, 0, stagingBuffer, 0, inputBufferSize);
+    device.queue.submit([commandEncoder.finish()]);
+
+    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    const inputArrayBuffer = stagingBuffer.getMappedRange().slice(0);
+    stagingBuffer.unmap();
+    stagingBuffer.destroy();
+
+    // 4. Create ONNX tensor and run inference
+    let inputTensor: ort.Tensor;
+    if (this.useFloat16) {
+      // For float16, the buffer contains packed float16 values
+      const float16Data = new Uint16Array(inputArrayBuffer);
+      inputTensor = new ort.Tensor('float16', float16Data, [1, 3, height, width]);
+    } else {
+      const float32Data = new Float32Array(inputArrayBuffer);
+      inputTensor = new ort.Tensor('float32', float32Data, [1, 3, height, width]);
+    }
+
+    const feeds: Record<string, ort.Tensor> = {
+      [this.session.inputNames[0]]: inputTensor
+    };
+
+    const results = await this.session.run(feeds);
+    const outputTensor = results[this.session.outputNames[0]];
+
+    // 5. Write ONNX output to GPU buffer for postprocessing
+    const outputWidth = width * scale;
+    const outputHeight = height * scale;
+
+    // Ensure we have a regular ArrayBuffer (not SharedArrayBuffer)
+    const rawData = outputTensor.data;
+    let outputArrayBuffer: ArrayBuffer;
+    if (this.useFloat16) {
+      const uint16Data = rawData as Uint16Array;
+      outputArrayBuffer = uint16Data.buffer instanceof SharedArrayBuffer
+        ? new Uint16Array(uint16Data).buffer
+        : uint16Data.buffer;
+      device.queue.writeBuffer(pool.outputBuffer, 0, outputArrayBuffer);
+    } else {
+      const float32Data = rawData as Float32Array;
+      outputArrayBuffer = float32Data.buffer instanceof SharedArrayBuffer
+        ? new Float32Array(float32Data).buffer
+        : float32Data.buffer;
+      device.queue.writeBuffer(pool.outputBuffer, 0, outputArrayBuffer);
+    }
+
+    // 6. Run postprocess shader: NCHW buffer → RGBA texture
+    runPostprocessShader(this.gpuContext, pool);
+
+    // 7. Copy output texture to canvas
+    await copyToCanvas(device, pool, this.canvas as OffscreenCanvas);
+
+    // Cleanup
+    inputTensor.dispose();
+    outputTensor.dispose();
+  }
+
+  /**
    * Render a frame directly (simplified path for video processing).
    */
   async render(frame: ImageBitmap | VideoFrame): Promise<void> {
+    // Use GPU path for VideoFrames when available
+    if (this.useGPUPath && 'codedWidth' in frame) {
+      try {
+        await this.renderGPU(frame as VideoFrame);
+        return;
+      } catch (e) {
+        console.warn('GPU render failed, falling back to CPU:', e);
+        this.useGPUPath = false;
+      }
+    }
+
+    // Fallback to CPU path
     await this.upscale(frame);
   }
 
@@ -470,6 +698,17 @@ export class Upscaler {
    * Dispose of resources.
    */
   async dispose(): Promise<void> {
+    // Clean up GPU resources
+    if (this.gpuBufferPool) {
+      destroyBufferPool(this.gpuBufferPool);
+      this.gpuBufferPool = null;
+    }
+    this.gpuContext = null;
+    this.useGPUPath = false;
+    this.lastFrameWidth = 0;
+    this.lastFrameHeight = 0;
+
+    // Clean up ONNX session
     if (this.session) {
       await this.session.release();
       this.session = null;
