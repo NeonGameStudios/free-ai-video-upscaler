@@ -35,6 +35,12 @@ module.exports = {
             {
                 test: /\.css$/i,
                 use: ["style-loader", "css-loader", "postcss-loader"],
+            },
+
+            // Load WGSL shaders as raw strings
+            {
+                test: /\.wgsl$/,
+                type: 'asset/source',
             }
 
         ],

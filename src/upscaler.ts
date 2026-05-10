@@ -10,6 +10,17 @@
 import * as ort from 'onnxruntime-web';
 import type { DenoiseLevel, ModelType } from './types/worker-messages';
 import { loadModel, type LoadProgressCallback } from './model-loader';
+import {
+  WebGPUContext,
+  GPUBufferPool,
+  getORTWebGPUDevice,
+  initWebGPUContext,
+  createBufferPool,
+  runPreprocessShader,
+  runPostprocessShader,
+  importVideoFrame,
+  destroyBufferPool,
+} from './webgpu-utils';
 
 /**
  * Convert a float32 value to float16 (IEEE 754 half-precision).
@@ -94,6 +105,13 @@ export class Upscaler {
   // Reusable canvas for preprocessing (avoid allocation per frame)
   private preprocessCanvas: OffscreenCanvas | null = null;
   private preprocessCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+  // GPU zero-copy rendering (when available)
+  private gpuContext: WebGPUContext | null = null;
+  private gpuBufferPool: GPUBufferPool | null = null;
+  private useGPUPath: boolean = false;
+  private lastFrameWidth: number = 0;
+  private lastFrameHeight: number = 0;
 
   constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
