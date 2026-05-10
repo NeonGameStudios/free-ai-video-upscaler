@@ -19,6 +19,7 @@ import {
   runPreprocessShader,
   runPostprocessShader,
   importVideoFrame,
+  copyToCanvas,
   destroyBufferPool,
 } from './webgpu-utils';
 
@@ -115,6 +116,61 @@ export class Upscaler {
 
   constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /**
+   * Initialize GPU zero-copy path after ONNX has set up its WebGPU device.
+   */
+  private async initGPUPath(): Promise<boolean> {
+    const device = getORTWebGPUDevice();
+    if (!device) {
+      console.log('WebGPU device not available from ONNX Runtime');
+      return false;
+    }
+
+    try {
+      this.gpuContext = await initWebGPUContext(device);
+      this.useGPUPath = true;
+      console.log('GPU zero-copy path initialized');
+      return true;
+    } catch (e) {
+      console.warn('Failed to initialize GPU path:', e);
+      return false;
+    }
+  }
+
+  /**
+   * Run a warmup inference to trigger ONNX WebGPU device initialization.
+   */
+  private async warmup(): Promise<void> {
+    if (!this.session) return;
+
+    console.log('Running warmup inference...');
+
+    // Create tiny test tensor (16x16)
+    const size = 16;
+    const tensorData = new Float32Array(3 * size * size);
+    let testTensor: ort.Tensor;
+
+    if (this.useFloat16) {
+      const float16Data = new Uint16Array(tensorData.length);
+      for (let i = 0; i < tensorData.length; i++) {
+        float16Data[i] = floatToFloat16(tensorData[i]);
+      }
+      testTensor = new ort.Tensor('float16', float16Data, [1, 3, size, size]);
+    } else {
+      testTensor = new ort.Tensor('float32', tensorData, [1, 3, size, size]);
+    }
+
+    try {
+      const output = await this.upscaleTile(testTensor);
+      output.dispose();
+    } finally {
+      testTensor.dispose();
+    }
+
+    // Now ONNX should have its WebGPU device ready
+    await this.initGPUPath();
   }
 
   /**
@@ -216,6 +272,16 @@ export class Upscaler {
     this.ctx = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
 
     this.initialized = true;
+
+    // Initialize GPU zero-copy path if WebGPU is available
+    if (useWebGPUForModel) {
+      try {
+        await this.warmup();
+      } catch (e) {
+        console.warn('GPU warmup failed, using CPU path:', e);
+        this.useGPUPath = false;
+      }
+    }
   }
 
   /**
@@ -496,9 +562,128 @@ export class Upscaler {
   }
 
   /**
+   * Render a frame using GPU zero-copy path.
+   * Eliminates CPU canvas operations by using WebGPU compute shaders.
+   */
+  private async renderGPU(frame: VideoFrame): Promise<void> {
+    if (!this.gpuContext || !this.session || !this.canvas) {
+      throw new Error('GPU path not initialized');
+    }
+
+    const width = frame.codedWidth;
+    const height = frame.codedHeight;
+    const device = this.gpuContext.device;
+    const { scale } = this.config;
+
+    // Create/recreate buffer pool if dimensions changed
+    if (!this.gpuBufferPool ||
+        this.lastFrameWidth !== width ||
+        this.lastFrameHeight !== height) {
+      if (this.gpuBufferPool) {
+        destroyBufferPool(this.gpuBufferPool);
+      }
+      this.gpuBufferPool = createBufferPool(
+        device, width, height, scale, this.useFloat16
+      );
+      this.lastFrameWidth = width;
+      this.lastFrameHeight = height;
+
+      // Resize output canvas
+      this.canvas.width = width * scale;
+      this.canvas.height = height * scale;
+    }
+
+    const pool = this.gpuBufferPool;
+
+    // 1. Import VideoFrame directly to GPU texture (zero-copy on supported browsers)
+    importVideoFrame(device, pool, frame);
+
+    // 2. Run preprocess shader: RGBA texture → NCHW buffer
+    runPreprocessShader(this.gpuContext, pool);
+
+    // 3. Read NCHW buffer back to CPU for ONNX
+    // (Future optimization: use ort.Tensor.fromGpuBuffer if ONNX supports it)
+    const inputBufferSize = 3 * width * height * 4; // float32 = 4 bytes
+    const stagingBuffer = device.createBuffer({
+      size: inputBufferSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    const commandEncoder = device.createCommandEncoder();
+    commandEncoder.copyBufferToBuffer(pool.inputBuffer, 0, stagingBuffer, 0, inputBufferSize);
+    device.queue.submit([commandEncoder.finish()]);
+
+    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    const inputArrayBuffer = stagingBuffer.getMappedRange().slice(0);
+    stagingBuffer.unmap();
+    stagingBuffer.destroy();
+
+    // 4. Create ONNX tensor and run inference
+    let inputTensor: ort.Tensor;
+    if (this.useFloat16) {
+      // For float16, the buffer contains packed float16 values
+      const float16Data = new Uint16Array(inputArrayBuffer);
+      inputTensor = new ort.Tensor('float16', float16Data, [1, 3, height, width]);
+    } else {
+      const float32Data = new Float32Array(inputArrayBuffer);
+      inputTensor = new ort.Tensor('float32', float32Data, [1, 3, height, width]);
+    }
+
+    const feeds: Record<string, ort.Tensor> = {
+      [this.session.inputNames[0]]: inputTensor
+    };
+
+    const results = await this.session.run(feeds);
+    const outputTensor = results[this.session.outputNames[0]];
+
+    // 5. Write ONNX output to GPU buffer for postprocessing
+    const outputWidth = width * scale;
+    const outputHeight = height * scale;
+
+    // Ensure we have a regular ArrayBuffer (not SharedArrayBuffer)
+    const rawData = outputTensor.data;
+    let outputArrayBuffer: ArrayBuffer;
+    if (this.useFloat16) {
+      const uint16Data = rawData as Uint16Array;
+      outputArrayBuffer = uint16Data.buffer instanceof SharedArrayBuffer
+        ? new Uint16Array(uint16Data).buffer
+        : uint16Data.buffer;
+      device.queue.writeBuffer(pool.outputBuffer, 0, outputArrayBuffer);
+    } else {
+      const float32Data = rawData as Float32Array;
+      outputArrayBuffer = float32Data.buffer instanceof SharedArrayBuffer
+        ? new Float32Array(float32Data).buffer
+        : float32Data.buffer;
+      device.queue.writeBuffer(pool.outputBuffer, 0, outputArrayBuffer);
+    }
+
+    // 6. Run postprocess shader: NCHW buffer → RGBA texture
+    runPostprocessShader(this.gpuContext, pool);
+
+    // 7. Copy output texture to canvas
+    await copyToCanvas(device, pool, this.canvas as OffscreenCanvas);
+
+    // Cleanup
+    inputTensor.dispose();
+    outputTensor.dispose();
+  }
+
+  /**
    * Render a frame directly (simplified path for video processing).
    */
   async render(frame: ImageBitmap | VideoFrame): Promise<void> {
+    // Use GPU path for VideoFrames when available
+    if (this.useGPUPath && 'codedWidth' in frame) {
+      try {
+        await this.renderGPU(frame as VideoFrame);
+        return;
+      } catch (e) {
+        console.warn('GPU render failed, falling back to CPU:', e);
+        this.useGPUPath = false;
+      }
+    }
+
+    // Fallback to CPU path
     await this.upscale(frame);
   }
 
@@ -513,6 +698,17 @@ export class Upscaler {
    * Dispose of resources.
    */
   async dispose(): Promise<void> {
+    // Clean up GPU resources
+    if (this.gpuBufferPool) {
+      destroyBufferPool(this.gpuBufferPool);
+      this.gpuBufferPool = null;
+    }
+    this.gpuContext = null;
+    this.useGPUPath = false;
+    this.lastFrameWidth = 0;
+    this.lastFrameHeight = 0;
+
+    // Clean up ONNX session
     if (this.session) {
       await this.session.release();
       this.session = null;

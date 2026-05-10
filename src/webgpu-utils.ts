@@ -317,7 +317,7 @@ export async function copyToCanvas(
   canvas: OffscreenCanvas
 ): Promise<void> {
   // Get WebGPU context from canvas
-  const canvasCtx = canvas.getContext('webgpu') as GPUCanvasContext;
+  const canvasCtx = canvas.getContext('webgpu') as unknown as GPUCanvasContext;
 
   if (!canvasCtx) {
     throw new Error('Failed to get WebGPU context from canvas');
