@@ -234,6 +234,30 @@ function getMimeType(format: OutputFormat): string {
 }
 
 /**
+ * Calculate the actual canvas dimensions used for encoding.
+ * Resolution presets cap native model output instead of upscaling beyond it.
+ */
+function getEncodeResolution(settings: ProcessSettings): Resolution {
+  const nativeWidth = resolution.width * currentScale;
+  const nativeHeight = resolution.height * currentScale;
+
+  if (!settings.targetHeight || nativeHeight <= settings.targetHeight) {
+    return { width: nativeWidth, height: nativeHeight };
+  }
+
+  const aspectRatio = nativeWidth / nativeHeight;
+  const height = makeEven(settings.targetHeight);
+  const width = makeEven(Math.round(height * aspectRatio));
+
+  return { width, height };
+}
+
+function makeEven(value: number): number {
+  const rounded = Math.max(2, Math.round(value));
+  return rounded % 2 === 0 ? rounded : rounded - 1;
+}
+
+/**
  * Main video processing function.
  * Accepts either inputHandle (FileSystemFileHandle) or inputFile (File) for remuxed MKV files.
  */
@@ -289,7 +313,20 @@ async function initRecording(
       target: target,
     });
 
-    const videoSource = new CanvasSource(upscaled_canvas, {
+    const encodeResolution = getEncodeResolution(settings);
+    const nativeOutputWidth = resolution.width * currentScale;
+    const nativeOutputHeight = resolution.height * currentScale;
+    const needsEncodeResize =
+      encodeResolution.width !== nativeOutputWidth ||
+      encodeResolution.height !== nativeOutputHeight;
+    const encodeCanvas = needsEncodeResize
+      ? new OffscreenCanvas(encodeResolution.width, encodeResolution.height)
+      : upscaled_canvas;
+    const encodeCtx = needsEncodeResize
+      ? encodeCanvas.getContext('2d', { alpha: false })
+      : null;
+
+    const videoSource = new CanvasSource(encodeCanvas, {
       codec: getCodec(settings.outputFormat),
       bitrate: QUALITY_HIGH,
       keyFrameInterval: 60,
@@ -379,6 +416,16 @@ async function initRecording(
 
         // Render through upscaler (skip "before" preview during processing for speed)
         await upscaler.render(videoFrame);
+
+        if (encodeCtx) {
+          encodeCtx.drawImage(
+            upscaled_canvas,
+            0,
+            0,
+            encodeResolution.width,
+            encodeResolution.height
+          );
+        }
 
         // Add frame to output video
         videoSource.add(sample.timestamp, sample.duration);

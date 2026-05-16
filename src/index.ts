@@ -627,8 +627,10 @@ function showError(message: string): void {
 function getBitrate(): number {
     const modelInfo = getModelInfo(currentModel);
     const scale = modelInfo?.scale || 4;
-    // Upscaling = scale^2 pixels, adjust bitrate accordingly
-    return 5e6 * (video.videoWidth * video.videoHeight * scale * scale) / (1280 * 720);
+    const outputWidth = (Alpine.store('outputWidth') as number) || video.videoWidth * scale;
+    const outputHeight = (Alpine.store('outputHeight') as number) || video.videoHeight * scale;
+
+    return 5e6 * (outputWidth * outputHeight) / (1280 * 720);
 }
 
 /**
