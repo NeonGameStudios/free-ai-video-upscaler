@@ -690,15 +690,12 @@ export class Upscaler {
           const keepW = keepEndX - keepStartX;
           const keepH = keepEndY - keepStartY;
 
-          // Adjust destination to account for the region we're keeping
-          const finalDstX = dstX + keepStartX;
-          const finalDstY = dstY + keepStartY;
-
-          // Put tile on output canvas
+          // putImageData applies dirtyX/dirtyY on top of dx/dy, so dx/dy must be
+          // the full tile origin rather than the cropped region origin.
           this.ctx.putImageData(
             outputImageData,
-            finalDstX,
-            finalDstY,
+            dstX,
+            dstY,
             keepStartX,
             keepStartY,
             keepW,
