@@ -9,7 +9,9 @@
 
 import * as ort from 'onnxruntime-web';
 import type { DenoiseLevel, ModelType } from './types/worker-messages';
-import { loadModel, type LoadProgressCallback } from './model-loader';
+import { loadModel, type LoadedModel, type LoadProgressCallback } from './model-loader';
+
+type UpscaleSource = ImageBitmap | VideoFrame | OffscreenCanvas;
 
 /**
  * Convert a float32 value to float16 (IEEE 754 half-precision).
@@ -82,6 +84,9 @@ export interface UpscalerConfig {
   scale: number;
   tileSize: number;
   tilePadding: number;
+  inputWidth?: number;
+  inputHeight?: number;
+  inputMultiple?: number;
   denoiseLevel?: DenoiseLevel;
 }
 
@@ -91,6 +96,9 @@ const DEFAULT_CONFIG: UpscalerConfig = {
   scale: 4,
   tileSize: 256,
   tilePadding: 32,
+  inputWidth: undefined,
+  inputHeight: undefined,
+  inputMultiple: 1,
   denoiseLevel: 0,
 };
 
@@ -105,6 +113,8 @@ export class Upscaler {
   private initialized: boolean = false;
   private useWebGPU: boolean = false;
   private useFloat16: boolean = false;
+  private executionProvider: 'webgpu' | 'wasm' = 'wasm';
+  private outputDataIsFloat32: boolean = false;
 
   // Reusable canvas for preprocessing (avoid allocation per frame)
   private preprocessCanvas: OffscreenCanvas | null = null;
@@ -170,42 +180,51 @@ export class Upscaler {
 
     // Check WebGPU support
     this.useWebGPU = await Upscaler.isWebGPUSupported();
+    this.useFloat16 = this.config.modelId.includes('animejanai');
+    this.outputDataIsFloat32 = false;
 
-    // AnimeJaNai models use float16 which has issues with WebGPU, use WASM
-    const isAnimeJaNai = this.config.modelId.includes('animejanai');
-    const useWebGPUForModel = this.useWebGPU && !isAnimeJaNai;
-
-    // Create session options
-    const sessionOptions: ort.InferenceSession.SessionOptions = {
-      executionProviders: useWebGPUForModel
-        ? ['webgpu', 'wasm']
-        : ['wasm'],
-      graphOptimizationLevel: 'all',
-    };
-
-    console.log(`Creating inference session (WebGPU: ${useWebGPUForModel})...`);
+    console.log(`Creating inference session (WebGPU available: ${this.useWebGPU})...`);
     console.log(`Loading model: ${this.config.modelId}`);
 
     try {
       // Download or retrieve model from cache
       onProgress?.(0, 'Loading model...');
-      const modelData = await loadModel(this.config.modelId, onProgress);
+      const loadedModel = await loadModel(this.config.modelId, onProgress, this.config.denoiseLevel);
 
-      onProgress?.(100, 'Initializing model...');
+      const canTryWebGPU = this.useWebGPU && !this.useFloat16;
+      const providerCandidates: ('webgpu' | 'wasm')[] = canTryWebGPU
+        ? ['webgpu', 'wasm']
+        : ['wasm'];
 
-      // Create session from ArrayBuffer
-      this.session = await ort.InferenceSession.create(
-        modelData,
-        sessionOptions
-      );
+      let lastError: unknown = null;
+
+      for (const provider of providerCandidates) {
+        try {
+          onProgress?.(100, `Initializing model with ${provider.toUpperCase()}...`);
+          this.session = await this.createValidatedSession(loadedModel, provider);
+          this.executionProvider = provider;
+          break;
+        } catch (e) {
+          lastError = e;
+          console.warn(`Failed to initialize ${provider.toUpperCase()} session:`, e);
+
+          if (this.session) {
+            await this.session.release();
+            this.session = null;
+          }
+        }
+      }
+
+      if (!this.session) {
+        throw lastError || new Error('No execution provider could load this model');
+      }
 
       console.log('Model loaded successfully');
       console.log('Input names:', this.session.inputNames);
       console.log('Output names:', this.session.outputNames);
-
-      // AnimeJaNai models use float16 input
-      this.useFloat16 = this.config.modelId.includes('animejanai');
       console.log('Using float16:', this.useFloat16);
+      console.log('Execution provider:', this.executionProvider);
+      console.log('Float16 output storage:', this.outputDataIsFloat32 ? 'float32' : 'uint16');
     } catch (e) {
       console.error('Failed to load model:', e);
       throw new Error(`Failed to load upscaling model: ${e}`);
@@ -217,6 +236,117 @@ export class Upscaler {
 
     this.initialized = true;
 
+  }
+
+  /**
+   * Create a session and run a small validation inference before using it.
+   * This lets float16 models try WebGPU safely while preserving WASM fallback.
+   */
+  private async createValidatedSession(
+    loadedModel: LoadedModel,
+    provider: 'webgpu' | 'wasm'
+  ): Promise<ort.InferenceSession> {
+    const sessionOptions: ort.InferenceSession.SessionOptions = {
+      executionProviders: provider === 'webgpu'
+        ? ['webgpu', 'wasm']
+        : ['wasm'],
+      graphOptimizationLevel: 'all',
+    };
+
+    if (loadedModel.externalData?.length) {
+      sessionOptions.externalData = loadedModel.externalData.map(({ path, data }) => ({ path, data }));
+    }
+
+    const session = await ort.InferenceSession.create(loadedModel.data, sessionOptions);
+
+    try {
+      await this.validateSession(session);
+      return session;
+    } catch (e) {
+      await session.release();
+      throw e;
+    }
+  }
+
+  private async validateSession(session: ort.InferenceSession): Promise<void> {
+    const defaultSize = this.config.scale === 1
+      ? 64
+      : Math.min(Math.max(this.config.tileSize, 64), 128);
+    const width = this.config.inputWidth ?? defaultSize;
+    const height = this.config.inputHeight ?? defaultSize;
+    const tensorLength = 3 * width * height;
+    const inputData = this.createValidationInput(tensorLength);
+    const input = this.useFloat16
+      ? new ort.Tensor('float16', inputData as Uint16Array, [1, 3, height, width])
+      : new ort.Tensor('float32', inputData as Float32Array, [1, 3, height, width]);
+
+    let outputs: ort.InferenceSession.OnnxValueMapType | null = null;
+
+    try {
+      outputs = await session.run({ [session.inputNames[0]]: input });
+
+      const output = outputs[session.outputNames[0]];
+      if (!output) {
+        throw new Error('Validation inference produced no output tensor');
+      }
+
+      if (this.useFloat16) {
+        this.outputDataIsFloat32 = output.data instanceof Float32Array;
+      }
+
+      if (!this.hasUsableOutput(output)) {
+        throw new Error('Validation inference produced unusable output');
+      }
+    } finally {
+      input.dispose();
+
+      if (outputs) {
+        for (const output of Object.values(outputs)) {
+          output.dispose();
+        }
+      }
+    }
+  }
+
+  private createValidationInput(length: number): Float32Array | Uint16Array {
+    if (this.useFloat16) {
+      const data = new Uint16Array(length);
+      for (let i = 0; i < length; i++) {
+        data[i] = BYTE_TO_FLOAT16[64 + (i % 128)];
+      }
+      return data;
+    }
+
+    const data = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      data[i] = BYTE_TO_FLOAT32[64 + (i % 128)];
+    }
+    return data;
+  }
+
+  private hasUsableOutput(output: ort.Tensor): boolean {
+    const data = output.data as Float32Array | Uint16Array;
+    const length = Math.min(data.length, 4096);
+    let max = -Infinity;
+    let min = Infinity;
+
+    if (this.useFloat16 && data instanceof Uint16Array) {
+      for (let i = 0; i < length; i++) {
+        const value = float16ToFloat(data[i]);
+        if (!Number.isFinite(value)) return false;
+        max = Math.max(max, value);
+        min = Math.min(min, value);
+      }
+    } else {
+      for (let i = 0; i < length; i++) {
+        const value = (data as Float32Array)[i];
+        if (!Number.isFinite(value)) return false;
+        max = Math.max(max, value);
+        min = Math.min(min, value);
+      }
+    }
+
+    return max > 0 && max >= min;
   }
 
   /**
@@ -256,27 +386,30 @@ export class Upscaler {
     // Only update non-model-related settings
     if (config.tileSize !== undefined) this.config.tileSize = config.tileSize;
     if (config.tilePadding !== undefined) this.config.tilePadding = config.tilePadding;
+    if (config.inputWidth !== undefined) this.config.inputWidth = config.inputWidth;
+    if (config.inputHeight !== undefined) this.config.inputHeight = config.inputHeight;
+    if (config.inputMultiple !== undefined) this.config.inputMultiple = config.inputMultiple;
     if (config.denoiseLevel !== undefined) this.config.denoiseLevel = config.denoiseLevel;
   }
 
   /**
-   * Get dimensions from source (ImageBitmap or VideoFrame).
+   * Get dimensions from source.
    */
-  private getSourceDimensions(source: ImageBitmap | VideoFrame): { width: number; height: number } {
+  private getSourceDimensions(source: UpscaleSource): { width: number; height: number } {
     if ('codedWidth' in source) {
       // VideoFrame
       return { width: source.displayWidth, height: source.displayHeight };
     }
-    // ImageBitmap
+    // ImageBitmap or OffscreenCanvas
     return { width: source.width, height: source.height };
   }
 
   /**
    * Preprocess an image for model input.
-   * Converts ImageBitmap/VideoFrame to normalized tensor (float32 or float16).
+   * Converts source pixels to normalized tensor (float32 or float16).
    */
   private async preprocess(
-    source: ImageBitmap | VideoFrame,
+    source: UpscaleSource,
     sx: number = 0,
     sy: number = 0,
     sw?: number,
@@ -285,20 +418,30 @@ export class Upscaler {
     const sourceDimensions = this.getSourceDimensions(source);
     const width = sw ?? sourceDimensions.width;
     const height = sh ?? sourceDimensions.height;
+    const tensorWidth = this.config.inputWidth ?? this.alignToInputMultiple(width);
+    const tensorHeight = this.config.inputHeight ?? this.alignToInputMultiple(height);
+
+    if (width > tensorWidth || height > tensorHeight) {
+      throw new Error(`Source tile ${width}x${height} exceeds model input ${tensorWidth}x${tensorHeight}`);
+    }
 
     // Reuse canvas if same size, otherwise create new one
-    if (!this.preprocessCanvas || this.preprocessCanvas.width !== width || this.preprocessCanvas.height !== height) {
-      this.preprocessCanvas = new OffscreenCanvas(width, height);
+    if (!this.preprocessCanvas || this.preprocessCanvas.width !== tensorWidth || this.preprocessCanvas.height !== tensorHeight) {
+      this.preprocessCanvas = new OffscreenCanvas(tensorWidth, tensorHeight);
       this.preprocessCtx = this.preprocessCanvas.getContext('2d', { willReadFrequently: true })!;
     }
 
     // Draw source or source tile to canvas
+    if (tensorWidth !== width || tensorHeight !== height) {
+      this.preprocessCtx!.clearRect(0, 0, tensorWidth, tensorHeight);
+    }
     this.preprocessCtx!.drawImage(source, sx, sy, width, height, 0, 0, width, height);
+    this.padCanvasEdges(width, height, tensorWidth, tensorHeight);
 
     // Get pixel data
-    const imageData = this.preprocessCtx!.getImageData(0, 0, width, height);
+    const imageData = this.preprocessCtx!.getImageData(0, 0, tensorWidth, tensorHeight);
     const pixels = imageData.data;
-    const planeSize = height * width;
+    const planeSize = tensorHeight * tensorWidth;
     const tensorLength = 3 * planeSize;
 
     if (this.useFloat16) {
@@ -313,7 +456,7 @@ export class Upscaler {
       }
 
       return {
-        tensor: new ort.Tensor('float16', this.inputFloat16, [1, 3, height, width]),
+        tensor: new ort.Tensor('float16', this.inputFloat16, [1, 3, tensorHeight, tensorWidth]),
         width,
         height
       };
@@ -330,10 +473,55 @@ export class Upscaler {
     }
 
     return {
-      tensor: new ort.Tensor('float32', this.inputFloat32, [1, 3, height, width]),
+      tensor: new ort.Tensor('float32', this.inputFloat32, [1, 3, tensorHeight, tensorWidth]),
       width,
       height
     };
+  }
+
+  private alignToInputMultiple(value: number): number {
+    const multiple = this.config.inputMultiple || 1;
+    if (multiple <= 1) return value;
+    return Math.ceil(value / multiple) * multiple;
+  }
+
+  private padCanvasEdges(
+    width: number,
+    height: number,
+    tensorWidth: number,
+    tensorHeight: number
+  ): void {
+    if (!this.preprocessCanvas || !this.preprocessCtx || (width === tensorWidth && height === tensorHeight)) {
+      return;
+    }
+
+    if (tensorWidth > width) {
+      this.preprocessCtx.drawImage(
+        this.preprocessCanvas,
+        width - 1,
+        0,
+        1,
+        height,
+        width,
+        0,
+        tensorWidth - width,
+        height
+      );
+    }
+
+    if (tensorHeight > height) {
+      this.preprocessCtx.drawImage(
+        this.preprocessCanvas,
+        0,
+        height - 1,
+        tensorWidth,
+        1,
+        0,
+        height,
+        tensorWidth,
+        tensorHeight - height
+      );
+    }
   }
 
   /**
@@ -358,12 +546,26 @@ export class Upscaler {
     const pixels = this.outputImageData.data;
 
     if (this.useFloat16) {
-      const data = output.data as Uint16Array;
-      for (let i = 0, p = 0; i < planeSize; i++, p += 4) {
-        pixels[p] = FLOAT16_TO_BYTE[data[i]];
-        pixels[p + 1] = FLOAT16_TO_BYTE[data[planeSize + i]];
-        pixels[p + 2] = FLOAT16_TO_BYTE[data[2 * planeSize + i]];
-        pixels[p + 3] = 255;
+      const data = output.data as Float32Array | Uint16Array;
+
+      if (data instanceof Uint16Array) {
+        for (let i = 0, p = 0; i < planeSize; i++, p += 4) {
+          pixels[p] = FLOAT16_TO_BYTE[data[i]];
+          pixels[p + 1] = FLOAT16_TO_BYTE[data[planeSize + i]];
+          pixels[p + 2] = FLOAT16_TO_BYTE[data[2 * planeSize + i]];
+          pixels[p + 3] = 255;
+        }
+      } else {
+        for (let i = 0, p = 0; i < planeSize; i++, p += 4) {
+          const r = data[i];
+          const g = data[planeSize + i];
+          const b = data[2 * planeSize + i];
+
+          pixels[p] = r <= 0 ? 0 : r >= 1 ? 255 : (r * 255 + 0.5) | 0;
+          pixels[p + 1] = g <= 0 ? 0 : g >= 1 ? 255 : (g * 255 + 0.5) | 0;
+          pixels[p + 2] = b <= 0 ? 0 : b >= 1 ? 255 : (b * 255 + 0.5) | 0;
+          pixels[p + 3] = 255;
+        }
       }
     } else {
       const data = output.data as Float32Array;
@@ -404,7 +606,7 @@ export class Upscaler {
    * Upscale an image/video frame using tiled processing.
    * This helps manage GPU memory for large images.
    */
-  async upscale(source: ImageBitmap | VideoFrame): Promise<void> {
+  async upscale(source: UpscaleSource): Promise<void> {
     if (!this.initialized || !this.session || !this.canvas || !this.ctx) {
       throw new Error('Upscaler not initialized');
     }
@@ -514,7 +716,7 @@ export class Upscaler {
   /**
    * Render a frame directly (simplified path for video processing).
    */
-  async render(frame: ImageBitmap | VideoFrame): Promise<void> {
+  async render(frame: UpscaleSource): Promise<void> {
     await this.upscale(frame);
   }
 
@@ -533,7 +735,16 @@ export class Upscaler {
       await this.session.release();
       this.session = null;
     }
+    this.clearFrameResources();
     this.initialized = false;
+  }
+
+  clearFrameResources(): void {
+    this.preprocessCanvas = null;
+    this.preprocessCtx = null;
+    this.inputFloat32 = null;
+    this.inputFloat16 = null;
+    this.outputImageData = null;
   }
 }
 

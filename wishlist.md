@@ -1,101 +1,110 @@
 # Wishlist / Known Limitations
 
-This document tracks known limitations in the current implementation and potential future improvements.
+This document tracks current limitations and future improvements for the local fork.
 
-## WebGPU Zero-Copy Path
+## Completed
 
-### 1. CPU Round-Trip Still Required Per Frame
+### 1. Remove Broken Custom WebGPU Zero-Copy Path
 
-**Current behavior:** The ONNX tensor data must be read from GPU buffer to CPU ArrayBuffer, then written back to GPU after inference.
+The custom shader path that imported `VideoFrame` into WebGPU textures has been removed from the active render path. It was faster in theory, but it bypassed the proven tiled renderer and could generate corrupted "snow" output.
 
-**Reasoning:** ONNX Runtime Web doesn't clearly expose APIs for accepting external GPU buffers. The `ort.Tensor.fromGpuBuffer()` API exists but documentation on sharing buffers with custom WebGPU pipelines is sparse. We use `ort.env.webgpu.device` to share the device, but buffer interop isn't straightforward.
+The app now uses ONNX Runtime's execution providers for model acceleration while keeping preprocessing, tiling, overlap handling, and canvas output on the reliable path shared by preview and full video processing.
 
-**Ideal solution:** ONNX Runtime accepts our `GPUBuffer` directly, keeping data on GPU throughout: VideoFrame → texture → our buffer → ONNX tensor → ONNX output buffer → our buffer → texture → canvas.
+### 2. Preserve Tiled Processing for Video Frames
 
----
+Video processing now uses the same tiled path as preview rendering. This keeps overlap handling intact and avoids whole-frame inference for larger inputs.
 
-### 2. No Tiled Processing in GPU Path
+The 360p case is fixed: frames such as 640x360 no longer produce negative tile origins when one dimension is smaller than the tile size.
 
-**Current behavior:** `renderGPU()` processes the entire frame at once. Large resolutions (4K+) may exceed GPU memory limits.
+### 3. MKV Container Support
 
-**Reasoning:** The CPU path implements tiling with overlap blending for seamless results. Porting this to the GPU path requires:
-- Multiple buffer pools or dynamic sizing
-- Compute shader modifications for tile coordinates
-- Overlap blending logic in the postprocess shader
+The file picker accepts `.mkv` files, and the app remuxes MKV input to MP4 before browser decoding. The UI shows the remuxing step while it runs.
 
-**Ideal solution:** Implement GPU-side tiling with configurable tile sizes (1024-2048px) and seamless blending.
+### 4. Output Resolution Presets Affect Encoding
 
----
+The 720p/1080p/etc. selector now caps the actual encoded canvas size instead of only changing the displayed estimate. This is especially useful for restoring 360p sources to 720p without writing unnecessary 4x output when a 4x model is selected.
 
-### 3. VideoFrame Only (No ImageBitmap Support)
+### 5. Safer WebGPU Provider Selection
 
-**Current behavior:** GPU path only activates for `VideoFrame` objects. `ImageBitmap` inputs fall back to CPU path.
+Model loading now tries ONNX Runtime WebGPU when WebGPU is available, validates the session with a small inference, and falls back to WASM if the model/provider combination fails.
 
-**Reasoning:** `VideoFrame` has `codedWidth`/`codedHeight` properties and can be efficiently imported to GPU texture via `copyExternalImageToTexture()`. ImageBitmap support would require different dimension detection and potentially less efficient texture upload.
+This allows AnimeJaNai float16 models to use WebGPU when the browser and ONNX Runtime support it, while preserving WASM reliability on unsupported setups.
 
-**Ideal solution:** Extend GPU path to handle ImageBitmap for image upscaling use cases.
+### 6. Progress Reports Completed Work
 
----
+Progress is reported after each frame finishes rendering and is queued for encoding. Finalization now posts `100%` after the output container is finalized.
 
-### 4. AnimeJaNai Models Excluded from WebGPU
+### 7. AnimeJaNai Float16 Output Handling
 
-**Current behavior:** Float16 AnimeJaNai models use WASM execution provider instead of WebGPU.
+AnimeJaNai models still use float16 input tensors, but ONNX Runtime Web may return float16 model output in a `Float32Array` depending on the execution provider. The renderer now detects that storage type during session validation and converts either float32-backed or uint16-backed float16 output correctly.
 
-**Reasoning:** ONNX Runtime Web's WebGPU execution provider has reported issues with float16 models. The WASM provider is more reliable for these models, though slower.
+This fixes the all-black AnimeJaNai output seen with the 15 second test clip.
 
-**Ideal solution:** Monitor ONNX Runtime Web updates for improved float16 WebGPU support. Our shaders already support float16 (`preprocess-f16.wgsl`, `postprocess-f16.wgsl`).
+### 8. Audio Passthrough And Runtime Cleanup
 
----
+When the source audio codec is supported by the selected output container, the worker now copies encoded audio packets directly instead of decoding and re-encoding. This keeps audio untouched for common MP4/AAC inputs and avoids the breakup introduced by unnecessary re-encoding. AAC priming packets with negative timestamps are skipped or retimed to begin at zero so the MP4 muxer accepts them.
 
-### 5. No Overlap Blending in GPU Path
+The worker also awaits video encoder backpressure, closes media sources, disposes the MediaBunny input, clears per-frame upscaler buffers after preview/conversion, and releases temporary resize canvases. The main thread now revokes old video/download object URLs and closes stale preview bitmaps when loading another file.
 
-**Current behavior:** When tiling is eventually added to GPU path, it won't have seamless blending initially.
+### 9. Target-Resolution Preview And Inference
 
-**Reasoning:** The CPU path uses `putImageData()` with dirty rectangle parameters to blend overlapping tile regions. GPU equivalent requires:
-- Storing overlap regions in separate buffers
-- Alpha blending in postprocess shader
-- Careful coordinate math for tile boundaries
+Preview rendering and full conversion now resize before model inference when the selected output preset caps the final resolution. For example, a 960x540 source targeting 720p with a 4x model now infers a 320x180 frame and writes 1280x720 output instead of previewing or processing a 3840x2160 intermediate.
 
-**Ideal solution:** Implement feathered blending in postprocess shader using distance-from-edge weights.
+When output is left on Auto, preview rendering is still capped at 1080p to avoid crashing during model selection. Full conversion still honors Auto/native scale.
 
----
+### 10. Real-CUGAN 2x Denoise Variants
 
-### 6. Canvas Context Recreation
+Real-CUGAN 2x is available through the model picker and maps the denoise slider to the hosted ONNX variants: no-denoise, denoise1x, denoise2x, and denoise3x. The loader supports the model's paired `.onnx` and `.onnx.data` files and caches both in IndexedDB.
 
-**Current behavior:** `copyToCanvas()` gets a new WebGPU context and calls `configure()` each frame.
+For low-bitrate 80s cartoon cleanup, start with denoise level 1, then try level 2 if action scenes still show block noise or shimmer.
 
-**Reasoning:** The output canvas is an `OffscreenCanvas` passed from the worker. WebGPU context configuration is idempotent but may have overhead. Caching the configured context would require tracking canvas identity.
+### 11. RealPLKSR Same-Resolution Cleanup Models
 
-**Ideal solution:** Cache the `GPUCanvasContext` and only reconfigure if canvas changes.
+The model picker now has a dedicated same-resolution cleanup group. These models run at 1x and automatically select "Keep Existing Resolution" when chosen:
 
----
+- `1xDeH264_realplksr` for low-bitrate video block noise
+- `1xDeJPG_realplksr_otf` for JPEG-like artifact removal
+- `1xDeNoise_realplksr_otf` for general image/video denoising
 
-### 7. Buffer Pool Recreation on Resolution Change
+These should be benchmarked against Real-CUGAN 2x denoise level 1 on the local cartoon clips before changing the default recommendation.
 
-**Current behavior:** If video frame dimensions change mid-stream, the entire `GPUBufferPool` is destroyed and recreated.
+### 12. SCUNet Blind Denoising
 
-**Reasoning:** GPU buffers have fixed sizes. Variable resolution video (rare) or seeking between different-resolution segments triggers full reallocation.
+SCUNet PSNR and SCUNet GAN are available as 1x same-resolution cleanup models. The hosted ONNX files use float32 NCHW input/output and return same-resolution frames. Runtime validation showed SCUNet requires dimensions that are multiples of 64, so the tiled renderer now pads non-conforming tiles by extending edge pixels before inference and crops the padded output when writing back to the canvas.
 
-**Ideal solution:** Pool multiple buffer sets for common resolutions, or allocate for max expected resolution upfront.
+SCUNet models are significantly larger than the RealPLKSR cleanup models at about 87 MiB each. Use SCUNet PSNR first for conservative blind denoising, and compare SCUNet GAN only when stronger cleanup is worth the extra risk of hallucinated texture.
 
----
+### 13. SwinIR JPEG Artifact Reduction
 
-## Other Improvements
+SwinIR JPEG40 is available as a 1x same-resolution cleanup model. No public browser-ready SwinIR JPEG ONNX artifact was found, so the local fork includes `scripts/convert_swinir_jpeg_to_onnx.py` to convert the official color JPEG artifact reduction weights from `deepinv/swinir`.
 
-### 8. MKV Container Support
+The generated model is fixed at 126x126 float32 NCHW input/output, uses JPEG quality 40 weights, and is served locally from `public/models/006_colorCAR_DFWB_s126w7_SwinIR-M_jpeg40.onnx`. The renderer uses fixed 126px SwinIR tiles with overlap so arbitrary video frame sizes can be processed through the fixed-size ONNX model.
 
-**Current behavior:** File picker only accepts MP4 and WebM. MKV files are rejected.
+Benchmark this against `RealPLKSR DeJPG 1x`, `RealPLKSR DeH264 1x`, and `Real-CUGAN 2x` denoise level 1 before making it a default recommendation.
 
-**Reasoning:** Browsers cannot decode MKV natively. FFmpeg.wasm remuxing was implemented but adds complexity and load time. The remux code exists in `src/remux.ts` but is disabled in the UI.
+## Remaining
 
-**Ideal solution:** Re-enable MKV support with clear user feedback about the remuxing step.
+### 1. RVRT / VRT Temporal Video Restoration
 
----
+Investigate RVRT or VRT for temporal cleanup across multiple frames. This is deferred because these models need multi-frame input windows or recurrent state, which requires a different worker pipeline than the current frame-by-frame renderer.
 
-### 9. Progress Reporting During GPU Inference
+### 2. True End-to-End GPU Buffer Interop
 
-**Current behavior:** Progress updates are frame-based but don't reflect actual GPU work completion.
+The current architecture still reads canvas pixels into CPU typed arrays before creating ONNX tensors. True zero-copy would require stable ONNX Runtime Web APIs for sharing external `GPUBuffer` objects across custom preprocessing, ONNX inference, and canvas output.
 
-**Reasoning:** GPU operations are asynchronous. `device.queue.submit()` returns immediately; actual completion is later. Accurate progress would require `GPUQueue.onSubmittedWorkDone()` callbacks.
+This should stay deferred until ONNX Runtime Web exposes and documents a reliable browser-side GPU buffer interop path for this use case.
 
-**Ideal solution:** Use WebGPU fence/callback APIs for accurate progress reporting.
+### 3. Test-Clip Benchmarking
+
+Once representative 360p VHS-quality clips are available locally, add a repeatable benchmark pass that records:
+
+- model selected
+- input and output resolution
+- per-frame render time
+- total encode time
+- output file size
+- visual sanity checks for snow/corruption
+
+### 4. Model/Content Recommendations
+
+After testing real clips, document which available model works best for noisy VHS-style footage. Anime-focused models may not be ideal for live-action VHS restoration, so this needs evidence from the local test clips rather than assumptions.

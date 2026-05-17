@@ -191,13 +191,17 @@
                         x-model="$store.selectedModel"
                         @change="onModelChange($event.target.value)"
                     >
-                        <template x-for="model in $store.models" :key="model.id">
-                            <option
-                                :value="model.id"
-                                :selected="model.id === $store.selectedModel"
-                                :disabled="!model.available"
-                                x-text="model.available ? model.name : model.name + ' (Coming Soon)'"
-                            ></option>
+                        <template x-for="group in $store.modelGroups" :key="group.id">
+                            <optgroup :label="group.name">
+                                <template x-for="model in group.models" :key="model.id">
+                                    <option
+                                        :value="model.id"
+                                        :selected="model.id === $store.selectedModel"
+                                        :disabled="!model.available"
+                                        x-text="model.available ? model.name : model.name + ' (Coming Soon)'"
+                                    ></option>
+                                </template>
+                            </optgroup>
                         </template>
                     </select>
                     <template x-for="model in $store.models" :key="model.id">
@@ -217,8 +221,8 @@
                             max="3"
                             step="1"
                             x-model="$store.selectedDenoise"
-                            @input="onDenoiseChange(parseInt($event.target.value))"
-                            :disabled="!$store.supportsDenoising"
+                            @change="onDenoiseChange(parseInt($event.target.value))"
+                            :disabled="!$store.supportsDenoising || $store.state !== 'preview'"
                         >
                         <span class="denoise-value" x-text="$store.selectedDenoise"></span>
                     </div>
@@ -243,7 +247,7 @@
 
             <!-- Output Resolution -->
             <div class="settings-row">
-                <span class="settings-label">Max Resolution</span>
+                <span class="settings-label">Output Resolution</span>
                 <div class="settings-control">
                     <select
                         x-model="$store.selectedResolution"
@@ -263,7 +267,7 @@
                     <span><span x-text="$store.width"></span> x <span x-text="$store.height"></span></span>
                 </div>
                 <div class="output-info-row">
-                    <span>Output (<span x-text="$store.currentScale"></span>x):</span>
+                    <span>Output (<span x-text="$store.selectedResolution === 'source' ? 'source' : $store.currentScale + 'x'"></span>):</span>
                     <span><span x-text="$store.outputWidth"></span> x <span x-text="$store.outputHeight"></span></span>
                 </div>
                 <div class="output-info-row">
@@ -295,6 +299,8 @@
         <div class="progress" id="progress">
             <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" x-bind:style="{width: $store.progress + '%'}" x-bind:aria-valuenow="$store.progress" aria-valuemin="0" aria-valuemax="100" style="width: 75%"></div>
         </div>
+
+        <button type="button" class="btn btn-outline-danger relative mx-auto mt-3 w-fit block" onclick="cancelRecording()">Stop</button>
     </div>
 
 

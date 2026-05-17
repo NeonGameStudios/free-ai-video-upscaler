@@ -22,7 +22,15 @@ export type ModelType =
   | 'realesrgan-general-fast'
   | 'realesrgan-general-plus'
   | 'realcugan-2x'
-  | 'realcugan-4x';
+  | 'realcugan-4x'
+  | 'realplksr-deh264-1x'
+  | 'realplksr-dejpg-1x'
+  | 'realplksr-denoise-1x'
+  | 'scunet-psnr'
+  | 'scunet-gan'
+  | 'swinir-jpeg40-1x';
+
+export type ModelCategory = 'upscale' | 'cleanup';
 
 // Model metadata
 export interface ModelInfo {
@@ -31,6 +39,7 @@ export interface ModelInfo {
   description: string;
   scale: number;
   supportsDenoising: boolean;
+  category: ModelCategory;
 }
 
 // All available models
@@ -40,77 +49,136 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     name: 'RealESR AnimeVideo v3',
     description: 'Optimized for anime videos (4x) - Recommended',
     scale: 4,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'animejanai-v3-sd',
     name: 'AnimeJaNai V3 - SD',
     description: 'Soft upscaling, faithful to source (2x)',
     scale: 2,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'animejanai-v3-hd',
     name: 'AnimeJaNai V3 - HD',
     description: 'Sharp upscaling for high quality sources (2x)',
     scale: 2,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'animejanai-v3-hd-fast',
     name: 'AnimeJaNai V3 - HD Fast',
     description: 'Fast HD upscaling, good balance of speed/quality (2x)',
     scale: 2,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'animejanai-v3-hd-superfast',
     name: 'AnimeJaNai V3 - HD Superfast',
     description: 'Fastest HD upscaling, lower quality (2x)',
     scale: 2,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'realesrgan-anime-fast',
     name: 'Real-ESRGAN Anime Fast',
     description: 'Fast anime upscaling (4x)',
     scale: 4,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'realesrgan-anime-plus',
     name: 'Real-ESRGAN Anime Plus',
     description: 'High quality anime upscaling (4x)',
     scale: 4,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'realesrgan-general-fast',
     name: 'Real-ESRGAN General Fast',
     description: 'Fast general content upscaling (4x)',
     scale: 4,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'realesrgan-general-plus',
     name: 'Real-ESRGAN General Plus',
     description: 'High quality general content upscaling (4x)',
     scale: 4,
-    supportsDenoising: false
+    supportsDenoising: false,
+    category: 'upscale'
   },
   {
     id: 'realcugan-2x',
     name: 'Real-CUGAN 2x',
     description: 'Conservative anime upscaling with denoising (2x)',
     scale: 2,
-    supportsDenoising: true
+    supportsDenoising: true,
+    category: 'upscale'
   },
   {
     id: 'realcugan-4x',
     name: 'Real-CUGAN 4x',
     description: 'High quality anime upscaling with denoising (4x)',
     scale: 4,
-    supportsDenoising: true
+    supportsDenoising: true,
+    category: 'upscale'
+  },
+  {
+    id: 'realplksr-deh264-1x',
+    name: 'RealPLKSR DeH264 1x',
+    description: 'Same-resolution H.264 compression artifact cleanup',
+    scale: 1,
+    supportsDenoising: false,
+    category: 'cleanup'
+  },
+  {
+    id: 'realplksr-dejpg-1x',
+    name: 'RealPLKSR DeJPG 1x',
+    description: 'Same-resolution JPEG/block artifact cleanup',
+    scale: 1,
+    supportsDenoising: false,
+    category: 'cleanup'
+  },
+  {
+    id: 'realplksr-denoise-1x',
+    name: 'RealPLKSR Denoise 1x',
+    description: 'Same-resolution general denoising without upscaling',
+    scale: 1,
+    supportsDenoising: false,
+    category: 'cleanup'
+  },
+  {
+    id: 'scunet-psnr',
+    name: 'SCUNet PSNR 1x',
+    description: 'Same-resolution blind denoising with conservative PSNR output',
+    scale: 1,
+    supportsDenoising: false,
+    category: 'cleanup'
+  },
+  {
+    id: 'scunet-gan',
+    name: 'SCUNet GAN 1x',
+    description: 'Same-resolution blind denoising with stronger GAN restoration',
+    scale: 1,
+    supportsDenoising: false,
+    category: 'cleanup'
+  },
+  {
+    id: 'swinir-jpeg40-1x',
+    name: 'SwinIR JPEG40 1x',
+    description: 'Same-resolution JPEG artifact and ringing cleanup',
+    scale: 1,
+    supportsDenoising: false,
+    category: 'cleanup'
   }
 ];
 
@@ -143,15 +211,16 @@ export const OUTPUT_FORMATS: OutputFormatInfo[] = [
 ];
 
 // Output resolution presets
-export type OutputResolution = 'auto' | '720p' | '1080p' | '1440p' | '4k';
+export type OutputResolution = 'source' | 'auto' | '720p' | '1080p' | '1440p' | '4k';
 
 export interface ResolutionPreset {
   id: OutputResolution;
   name: string;
-  maxHeight: number | null; // null means use model's native scale
+  maxHeight: number | null; // null means resolved dynamically by the caller
 }
 
 export const RESOLUTION_PRESETS: ResolutionPreset[] = [
+  { id: 'source', name: 'Keep Existing Resolution', maxHeight: null },
   { id: 'auto', name: 'Auto (Native Scale)', maxHeight: null },
   { id: '720p', name: '720p (1280×720)', maxHeight: 720 },
   { id: '1080p', name: '1080p (1920×1080)', maxHeight: 1080 },
@@ -174,6 +243,9 @@ export interface ModelConfig {
   scale: number;
   tileSize: number;
   tilePadding: number;
+  inputWidth?: number;
+  inputHeight?: number;
+  inputMultiple?: number;
   denoiseLevel?: DenoiseLevel;
 }
 
@@ -182,6 +254,7 @@ export type WorkerRequestMessage =
   | { cmd: 'isSupported' }
   | { cmd: 'init'; data: InitData }
   | { cmd: 'switchModel'; data: SwitchModelData }
+  | { cmd: 'cancel' }
   | { cmd: 'process'; inputHandle?: FileSystemFileHandle; inputFile?: File; outputHandle?: FileSystemFileHandle; settings: ProcessSettings };
 
 export interface InitData {
@@ -190,11 +263,13 @@ export interface InitData {
   original: OffscreenCanvas;
   resolution: Resolution;
   modelConfig: ModelConfig;
+  targetHeight?: number;
 }
 
 export interface SwitchModelData {
   bitmap: ImageBitmap;
   modelConfig: ModelConfig;
+  targetHeight?: number;
 }
 
 export interface ProcessSettings {
@@ -207,10 +282,12 @@ export interface ProcessSettings {
 export type WorkerResponseMessage =
   | { cmd: 'isSupported'; data: boolean }
   | { cmd: 'modelLoading'; data: number }
+  | { cmd: 'status'; data: string }
   | { cmd: 'modelLoaded' }
   | { cmd: 'progress'; data: number }
   | { cmd: 'eta'; data: string }
   | { cmd: 'process' }
+  | { cmd: 'cancelled' }
   | { cmd: 'error'; data: string }
   | { cmd: 'finished'; data: ArrayBuffer | null };
 

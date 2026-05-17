@@ -5,15 +5,34 @@
  * for faster subsequent loads.
  */
 
-import type { ModelType } from './types/worker-messages';
+import type { DenoiseLevel, ModelType } from './types/worker-messages';
 
 // IndexedDB configuration
 const DB_NAME = 'upscaler-models';
 const DB_VERSION = 1;
 const STORE_NAME = 'models';
 
-// Model download URLs from Hugging Face
-// Using resolve/main/ pattern which redirects to CDN
+interface ExternalModelAsset {
+  path: string;
+  url: string;
+  size: number;
+}
+
+interface ModelAsset {
+  cacheKey: string;
+  url: string;
+  size: number;
+  externalData?: ExternalModelAsset[];
+}
+
+export interface LoadedModel {
+  data: ArrayBuffer;
+  externalData?: Array<{ path: string; data: ArrayBuffer }>;
+}
+
+const HUGGLYBERRY_MODEL_BASE = 'https://huggingface.co/hugglyberry/upscale-and-refine-models/resolve/main';
+
+// Model download URLs from Hugging Face. Using resolve/main/ pattern redirects to CDN.
 const MODEL_URLS: Record<ModelType, string> = {
   // RealESR AnimeVideo v3 - compact model optimized for anime videos
   // Uses lightweight 4B32F architecture from xiongjie's repo
@@ -30,9 +49,47 @@ const MODEL_URLS: Record<ModelType, string> = {
   // Real-ESRGAN general models - need to be converted and hosted (Qualcomm removed theirs)
   'realesrgan-general-fast': '',
   'realesrgan-general-plus': '',
-  // Real-CUGAN models - placeholder URLs (need to be converted and hosted)
-  'realcugan-2x': '',
+  // Real-CUGAN 2x is resolved by denoise level because its ONNX models use external weights.
+  'realcugan-2x': `${HUGGLYBERRY_MODEL_BASE}/realcugan-2x-denoise1x.onnx`,
   'realcugan-4x': '',
+  // Same-resolution cleanup models for compression/noise restoration
+  'realplksr-deh264-1x': `${HUGGLYBERRY_MODEL_BASE}/1xDeH264_realplksr.onnx`,
+  'realplksr-dejpg-1x': `${HUGGLYBERRY_MODEL_BASE}/1xDeJPG_realplksr_otf.onnx`,
+  'realplksr-denoise-1x': `${HUGGLYBERRY_MODEL_BASE}/1xDeNoise_realplksr_otf.onnx`,
+  'scunet-psnr': `${HUGGLYBERRY_MODEL_BASE}/SCUNet-PSNR.onnx`,
+  'scunet-gan': `${HUGGLYBERRY_MODEL_BASE}/SCUNet-GAN.onnx`,
+  'swinir-jpeg40-1x': '/models/006_colorCAR_DFWB_s126w7_SwinIR-M_jpeg40.onnx',
+};
+
+const REALCUGAN_2X_VARIANTS: Record<DenoiseLevel, { name: string; onnx: string; data: string; onnxSize: number; dataSize: number }> = {
+  0: {
+    name: 'no-denoise',
+    onnx: 'realcugan-2x-no-denoise.onnx',
+    data: 'realcugan-2x-no-denoise.onnx.data',
+    onnxSize: 184_677,
+    dataSize: 5_177_344,
+  },
+  1: {
+    name: 'denoise1x',
+    onnx: 'realcugan-2x-denoise1x.onnx',
+    data: 'realcugan-2x-denoise1x.onnx.data',
+    onnxSize: 184_639,
+    dataSize: 5_177_344,
+  },
+  2: {
+    name: 'denoise2x',
+    onnx: 'realcugan-2x-denoise2x.onnx',
+    data: 'realcugan-2x-denoise2x.onnx.data',
+    onnxSize: 184_639,
+    dataSize: 5_177_344,
+  },
+  3: {
+    name: 'denoise3x',
+    onnx: 'realcugan-2x-denoise3x.onnx',
+    data: 'realcugan-2x-denoise3x.onnx.data',
+    onnxSize: 184_639,
+    dataSize: 5_177_344,
+  },
 };
 
 // Model file sizes for progress calculation (approximate, in bytes)
@@ -48,6 +105,12 @@ const MODEL_SIZES: Record<ModelType, number> = {
   'realesrgan-general-plus': 67_100_000,       // ~67.1 MB
   'realcugan-2x': 20_000_000,                  // Estimated ~20 MB
   'realcugan-4x': 40_000_000,                  // Estimated ~40 MB
+  'realplksr-deh264-1x': 29_798_760,           // ~28.4 MiB
+  'realplksr-dejpg-1x': 29_798_760,            // ~28.4 MiB
+  'realplksr-denoise-1x': 29_874_321,          // ~28.5 MiB
+  'scunet-psnr': 91_264_256,                   // ~87.0 MiB
+  'scunet-gan': 91_264_256,                    // ~87.0 MiB
+  'swinir-jpeg40-1x': 52_313_059,              // ~49.9 MiB local converted model
 };
 
 export type LoadProgressCallback = (progress: number, message: string) => void;
@@ -79,13 +142,13 @@ async function openDatabase(): Promise<IDBDatabase> {
 /**
  * Get a cached model from IndexedDB.
  */
-async function getCachedModel(modelId: ModelType): Promise<ArrayBuffer | null> {
+async function getCachedModel(cacheKey: string): Promise<ArrayBuffer | null> {
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, 'readonly');
       const store = transaction.objectStore(STORE_NAME);
-      const request = store.get(modelId);
+      const request = store.get(cacheKey);
 
       request.onerror = () => {
         db.close();
@@ -106,13 +169,13 @@ async function getCachedModel(modelId: ModelType): Promise<ArrayBuffer | null> {
 /**
  * Cache a model in IndexedDB.
  */
-async function cacheModel(modelId: ModelType, data: ArrayBuffer): Promise<void> {
+async function cacheModel(cacheKey: string, data: ArrayBuffer): Promise<void> {
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
-      const request = store.put(data, modelId);
+      const request = store.put(data, cacheKey);
 
       request.onerror = () => {
         console.warn('Failed to cache model:', request.error);
@@ -149,7 +212,8 @@ async function downloadModel(
   url: string,
   expectedSize: number,
   onProgress?: LoadProgressCallback,
-  retryCount: number = 1
+  retryCount: number = 1,
+  validateOnnx: boolean = true
 ): Promise<ArrayBuffer> {
   let lastError: Error | null = null;
 
@@ -206,7 +270,7 @@ async function downloadModel(
       }
 
       // Validate the downloaded data
-      if (!validateOnnxData(buffer.buffer)) {
+      if (validateOnnx && !validateOnnxData(buffer.buffer)) {
         throw new Error('Downloaded file does not appear to be a valid ONNX model');
       }
 
@@ -230,16 +294,51 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function getModelAsset(modelId: ModelType, denoiseLevel: DenoiseLevel = 0): ModelAsset {
+  if (modelId === 'realcugan-2x') {
+    const variant = REALCUGAN_2X_VARIANTS[denoiseLevel] || REALCUGAN_2X_VARIANTS[0];
+    return {
+      cacheKey: `${modelId}:${variant.name}`,
+      url: `${HUGGLYBERRY_MODEL_BASE}/${variant.onnx}`,
+      size: variant.onnxSize,
+      externalData: [{
+        path: variant.data,
+        url: `${HUGGLYBERRY_MODEL_BASE}/${variant.data}`,
+        size: variant.dataSize,
+      }],
+    };
+  }
+
+  return {
+    cacheKey: modelId,
+    url: MODEL_URLS[modelId],
+    size: MODEL_SIZES[modelId],
+  };
+}
+
+function scaleProgress(
+  onProgress: LoadProgressCallback | undefined,
+  start: number,
+  end: number
+): LoadProgressCallback | undefined {
+  if (!onProgress) return undefined;
+
+  return (progress, message) => {
+    const scaledProgress = Math.round(start + (progress / 100) * (end - start));
+    onProgress(Math.min(end, scaledProgress), message);
+  };
+}
+
 /**
  * Evict a cached model from IndexedDB.
  */
-async function evictCachedModel(modelId: ModelType): Promise<void> {
+async function evictCachedModel(cacheKey: string): Promise<void> {
   try {
     const db = await openDatabase();
     return new Promise((resolve) => {
       const transaction = db.transaction(STORE_NAME, 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
-      const request = store.delete(modelId);
+      const request = store.delete(cacheKey);
       request.onsuccess = () => { db.close(); resolve(); };
       request.onerror = () => { db.close(); resolve(); };
     });
@@ -255,49 +354,94 @@ async function evictCachedModel(modelId: ModelType): Promise<void> {
  */
 export async function loadModel(
   modelId: ModelType,
-  onProgress?: LoadProgressCallback
-): Promise<ArrayBuffer> {
-  // Check cache first
-  onProgress?.(0, 'Checking cache...');
-  const cached = await getCachedModel(modelId);
+  onProgress?: LoadProgressCallback,
+  denoiseLevel?: DenoiseLevel
+): Promise<LoadedModel> {
+  const asset = getModelAsset(modelId, denoiseLevel);
 
-  if (cached) {
-    // Validate cached data
-    if (validateOnnxData(cached)) {
-      onProgress?.(100, 'Loaded from cache');
-      return cached;
-    }
-    // Corrupt cache - evict and re-download
-    console.warn(`Cached model ${modelId} appears corrupt, re-downloading...`);
-    await evictCachedModel(modelId);
-  }
-
-  // Get download URL
-  const url = MODEL_URLS[modelId];
-
-  if (!url) {
+  if (!asset.url) {
     throw new Error(
       `Model "${modelId}" is not available for download. ` +
       `Please run the conversion script: python scripts/convert_model.py ${modelId}`
     );
   }
 
-  // Download the model
-  onProgress?.(0, 'Starting download...');
-  const data = await downloadModel(url, MODEL_SIZES[modelId], onProgress);
+  // Check cache first
+  onProgress?.(0, 'Checking cache...');
+  let modelData = await getCachedModel(asset.cacheKey);
 
-  // Cache for future use
-  onProgress?.(100, 'Caching model...');
-  await cacheModel(modelId, data);
+  if (modelData) {
+    // Validate cached data
+    if (validateOnnxData(modelData)) {
+      onProgress?.(asset.externalData ? 20 : 100, 'Loaded model from cache');
+    } else {
+      // Corrupt cache - evict and re-download
+      console.warn(`Cached model ${asset.cacheKey} appears corrupt, re-downloading...`);
+      await evictCachedModel(asset.cacheKey);
+      modelData = null;
+    }
+  }
 
-  return data;
+  if (!modelData) {
+    // Download the model
+    onProgress?.(0, 'Starting download...');
+    modelData = await downloadModel(
+      asset.url,
+      asset.size,
+      scaleProgress(onProgress, 0, asset.externalData ? 20 : 100)
+    );
+
+    // Cache for future use
+    onProgress?.(asset.externalData ? 20 : 100, 'Caching model...');
+    await cacheModel(asset.cacheKey, modelData);
+  }
+
+  if (!asset.externalData?.length) {
+    return { data: modelData };
+  }
+
+  const externalData: LoadedModel['externalData'] = [];
+  const progressRange = 80 / asset.externalData.length;
+
+  for (let i = 0; i < asset.externalData.length; i++) {
+    const externalAsset = asset.externalData[i];
+    const cacheKey = `${asset.cacheKey}:external:${externalAsset.path}`;
+    let externalBuffer = await getCachedModel(cacheKey);
+    const start = 20 + i * progressRange;
+    const end = 20 + (i + 1) * progressRange;
+
+    if (externalBuffer) {
+      onProgress?.(Math.round(end), `Loaded ${externalAsset.path} from cache`);
+    } else {
+      externalBuffer = await downloadModel(
+        externalAsset.url,
+        externalAsset.size,
+        scaleProgress(onProgress, start, end),
+        1,
+        false
+      );
+      await cacheModel(cacheKey, externalBuffer);
+    }
+
+    externalData.push({
+      path: externalAsset.path,
+      data: externalBuffer,
+    });
+  }
+
+  onProgress?.(100, 'Model ready');
+
+  return {
+    data: modelData,
+    externalData,
+  };
 }
 
 /**
  * Check if a model is available (either cached or has download URL).
  */
 export function isModelAvailable(modelId: ModelType): boolean {
-  return !!MODEL_URLS[modelId];
+  return !!getModelAsset(modelId).url;
 }
 
 /**
@@ -337,7 +481,7 @@ export async function clearModelCache(): Promise<void> {
  * Check if a specific model is cached.
  */
 export async function isModelCached(modelId: ModelType): Promise<boolean> {
-  const cached = await getCachedModel(modelId);
+  const cached = await getCachedModel(getModelAsset(modelId).cacheKey);
   return cached !== null;
 }
 

@@ -18,6 +18,8 @@ import {
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
+  ModelInfo,
+  ModelCategory,
   ModelType,
   DenoiseLevel,
   OutputFormat,
@@ -28,14 +30,20 @@ import { isModelAvailable } from './model-loader';
 import { needsRemux, remuxToMp4, getBaseName } from './remux';
 
 // Extended model info with availability status for UI
-interface ModelInfoWithAvailability {
-  id: ModelType;
-  name: string;
-  description: string;
-  scale: number;
-  supportsDenoising: boolean;
+interface ModelInfoWithAvailability extends ModelInfo {
   available: boolean;
 }
+
+interface ModelGroupWithAvailability {
+    id: ModelCategory;
+    name: string;
+    models: ModelInfoWithAvailability[];
+}
+
+const MODEL_CATEGORY_LABELS: Record<ModelCategory, string> = {
+    upscale: 'Upscaling Models',
+    cleanup: 'Same-Resolution Cleanup',
+};
 
 import 'bootstrap';
 import 'bootstrap/dist/css/bootstrap.min.css';
@@ -50,12 +58,16 @@ let upscaled_canvas: HTMLCanvasElement;
 let original_canvas: HTMLCanvasElement;
 let video: HTMLVideoElement;
 let previewBitmap: ImageBitmap | null = null;
+let videoObjectUrl: string | null = null;
+let downloadUrl: string | null = null;
 
 // Current settings
 let currentModel: ModelType = 'realesr-animevideov3';
 let currentDenoiseLevel: DenoiseLevel = 0;
 let currentOutputFormat: OutputFormat = 'mp4';
 let currentOutputResolution: OutputResolution = 'auto';
+const MAX_AUTO_PREVIEW_HEIGHT = 1080;
+const MAX_CLEANUP_PREVIEW_HEIGHT = 144;
 
 // Video data
 let download_name: string;
@@ -67,9 +79,10 @@ declare global {
     interface Window {
         chooseFile: (e?: Event) => Promise<void>;
         initRecording: () => Promise<void>;
+        cancelRecording: () => void;
         fullScreenPreview: (e?: Event) => Promise<void>;
         onModelChange: (modelId: string) => Promise<void>;
-        onDenoiseChange: (level: number) => void;
+        onDenoiseChange: (level: number) => Promise<void>;
         onFormatChange: (format: string) => void;
         onResolutionChange: (resolution: string) => void;
         showSaveFilePicker: (options?: any) => Promise<FileSystemFileHandle>;
@@ -87,6 +100,7 @@ document.addEventListener("DOMContentLoaded", index);
 async function index(): Promise<void> {
     // Expose functions to window immediately for onclick handlers
     window.initRecording = initRecording;
+    window.cancelRecording = cancelRecording;
     window.chooseFile = chooseFile;
 
     Alpine.store('state', 'init');
@@ -96,9 +110,17 @@ async function index(): Promise<void> {
         ...model,
         available: isModelAvailable(model.id)
     }));
+    const modelGroups: ModelGroupWithAvailability[] = (Object.keys(MODEL_CATEGORY_LABELS) as ModelCategory[])
+        .map(category => ({
+            id: category,
+            name: MODEL_CATEGORY_LABELS[category],
+            models: modelsWithAvailability.filter(model => model.category === category),
+        }))
+        .filter(group => group.models.length > 0);
 
     // Initialize settings stores
     Alpine.store('models', modelsWithAvailability);
+    Alpine.store('modelGroups', modelGroups);
     Alpine.store('formats', OUTPUT_FORMATS);
     Alpine.store('resolutions', RESOLUTION_PRESETS);
 
@@ -126,6 +148,7 @@ async function index(): Promise<void> {
 
     // Set up global functions
     window.chooseFile = chooseFile;
+    window.cancelRecording = cancelRecording;
     window.onModelChange = onModelChange;
     window.onDenoiseChange = onDenoiseChange;
     window.onFormatChange = onFormatChange;
@@ -190,10 +213,16 @@ async function onModelChange(modelId: string): Promise<void> {
         Alpine.store('selectedDenoise', 0);
     }
 
+    if (modelInfo.scale === 1) {
+        currentOutputResolution = 'source';
+        Alpine.store('selectedResolution', currentOutputResolution);
+    }
+
     // Update output dimensions display
     if (video) {
         updateOutputDimensions();
     }
+    updateDownloadName();
 
     // If we have a preview, switch the model
     if (previewBitmap && Alpine.store('state') === 'preview') {
@@ -206,7 +235,8 @@ async function onModelChange(modelId: string): Promise<void> {
             cmd: 'switchModel',
             data: {
                 bitmap: previewBitmap,
-                modelConfig
+                modelConfig,
+                targetHeight: getPreviewTargetHeight(),
             }
         } satisfies WorkerRequestMessage);
     }
@@ -215,9 +245,26 @@ async function onModelChange(modelId: string): Promise<void> {
 /**
  * Handle denoise level change.
  */
-function onDenoiseChange(level: number): void {
+async function onDenoiseChange(level: number): Promise<void> {
     currentDenoiseLevel = level as DenoiseLevel;
     Alpine.store('selectedDenoise', currentDenoiseLevel);
+
+    const modelInfo = getModelInfo(currentModel);
+    if (!modelInfo?.supportsDenoising) return;
+
+    if (previewBitmap && Alpine.store('state') === 'preview') {
+        Alpine.store('state', 'loading');
+        Alpine.store('loading_message', 'Switching denoise level...');
+
+        worker.postMessage({
+            cmd: 'switchModel',
+            data: {
+                bitmap: previewBitmap,
+                modelConfig: getModelConfig(),
+                targetHeight: getPreviewTargetHeight(),
+            }
+        } satisfies WorkerRequestMessage);
+    }
 }
 
 /**
@@ -236,6 +283,7 @@ function onResolutionChange(resolution: string): void {
     currentOutputResolution = resolution as OutputResolution;
     Alpine.store('selectedResolution', currentOutputResolution);
     updateOutputDimensions();
+    updateDownloadName();
 }
 
 /**
@@ -243,11 +291,18 @@ function onResolutionChange(resolution: string): void {
  */
 function getModelConfig(): ModelConfig {
     const modelInfo = getModelInfo(currentModel);
+    const scale = modelInfo?.scale || 4;
+    const isScunet = currentModel.startsWith('scunet-');
+    const isSwinirJpeg = currentModel.startsWith('swinir-jpeg');
+
     return {
         modelId: currentModel,
-        scale: modelInfo?.scale || 4,
-        tileSize: 512,
-        tilePadding: 32,
+        scale,
+        tileSize: isSwinirJpeg ? 126 : isScunet ? 256 : scale === 2 ? 1024 : 512,
+        tilePadding: isSwinirJpeg ? 14 : 32,
+        inputWidth: isSwinirJpeg ? 126 : undefined,
+        inputHeight: isSwinirJpeg ? 126 : undefined,
+        inputMultiple: isScunet ? 64 : undefined,
         denoiseLevel: modelInfo?.supportsDenoising ? currentDenoiseLevel : undefined,
     };
 }
@@ -257,6 +312,12 @@ function getModelConfig(): ModelConfig {
  */
 function updateOutputDimensions(): void {
     if (!video) return;
+
+    if (currentOutputResolution === 'source') {
+        Alpine.store('outputWidth', video.videoWidth);
+        Alpine.store('outputHeight', video.videoHeight);
+        return;
+    }
 
     const modelInfo = getModelInfo(currentModel);
     const scale = modelInfo?.scale || 4;
@@ -280,14 +341,54 @@ function updateOutputDimensions(): void {
  * Update download filename based on current settings.
  */
 function updateDownloadName(): void {
-    if (!video) return;
-
     const formatInfo = getFormatInfo(currentOutputFormat);
     const modelInfo = getModelInfo(currentModel);
     const baseName = (Alpine.store('filename') as string)?.split(".")[0] || 'video';
+    const resolutionSuffix = currentOutputResolution === 'source' ? 'source' : `${modelInfo?.scale || 4}x`;
 
-    download_name = `${baseName}-upscaled-${modelInfo?.scale || 4}x${formatInfo?.extension || '.mp4'}`;
+    download_name = `${baseName}-upscaled-${resolutionSuffix}${formatInfo?.extension || '.mp4'}`;
     Alpine.store('download_name', download_name);
+}
+
+function getTargetHeight(): number | undefined {
+    if (currentOutputResolution === 'source') {
+        return video?.videoHeight || undefined;
+    }
+
+    return getResolutionPreset(currentOutputResolution)?.maxHeight || undefined;
+}
+
+function getPreviewTargetHeight(): number | undefined {
+    const targetHeight = getTargetHeight();
+    const modelInfo = getModelInfo(currentModel);
+
+    if (modelInfo?.category === 'cleanup') {
+        return Math.min(targetHeight || MAX_CLEANUP_PREVIEW_HEIGHT, MAX_CLEANUP_PREVIEW_HEIGHT);
+    }
+
+    return targetHeight || MAX_AUTO_PREVIEW_HEIGHT;
+}
+
+function clearMediaObjectUrls(): void {
+    previewBitmap?.close();
+    previewBitmap = null;
+
+    if (video) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+    }
+
+    if (videoObjectUrl) {
+        URL.revokeObjectURL(videoObjectUrl);
+        videoObjectUrl = null;
+    }
+
+    if (downloadUrl) {
+        URL.revokeObjectURL(downloadUrl);
+        downloadUrl = null;
+        Alpine.store('download_url', '');
+    }
 }
 
 //===================  Preview ===========================
@@ -299,6 +400,7 @@ function updateDownloadName(): void {
 async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Loading video...');
+    clearMediaObjectUrls();
 
     // Get the file to check format and create preview
     const file = await fileHandle.getFile();
@@ -348,7 +450,8 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
 
     const fileBlob = new Blob([data], { type: "video/mp4" });
 
-    video.src = URL.createObjectURL(fileBlob);
+    videoObjectUrl = URL.createObjectURL(fileBlob);
+    video.src = videoObjectUrl;
 
     const imageCompare = document.getElementById('image-compare-outer') as HTMLElement;
 
@@ -410,7 +513,8 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
                     width: video.videoWidth,
                     height: video.videoHeight
                 },
-                modelConfig
+                modelConfig,
+                targetHeight: getPreviewTargetHeight(),
             }
         } satisfies WorkerRequestMessage, [upscaled, original]);
 
@@ -538,6 +642,9 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
             Alpine.store('loading_message', 'Initializing AI model...');
         }
 
+    } else if (event.data.cmd === 'status') {
+        Alpine.store('loading_message', event.data.data);
+
     } else if (event.data.cmd === 'modelLoaded') {
         Alpine.store('state', 'preview');
 
@@ -559,8 +666,17 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
         if (event.data.data) {
             const formatInfo = getFormatInfo(currentOutputFormat);
             const blob = new Blob([event.data.data], { type: formatInfo?.mimeType || "video/mp4" });
-            Alpine.store('download_url', window.URL.createObjectURL(blob));
+            if (downloadUrl) {
+                URL.revokeObjectURL(downloadUrl);
+            }
+            downloadUrl = URL.createObjectURL(blob);
+            Alpine.store('download_url', downloadUrl);
         }
+
+    } else if (event.data.cmd === 'cancelled') {
+        Alpine.store('progress', 0);
+        Alpine.store('eta', '');
+        Alpine.store('state', 'preview');
     }
 };
 
@@ -595,8 +711,6 @@ async function initRecording(): Promise<void> {
         }
     }
 
-    const resPreset = getResolutionPreset(currentOutputResolution);
-
     // Pass either inputHandle (for regular files) or inputFile (for remuxed MKV)
     const message: WorkerRequestMessage = {
         cmd: "process",
@@ -606,11 +720,17 @@ async function initRecording(): Promise<void> {
         settings: {
             outputFormat: currentOutputFormat,
             outputResolution: currentOutputResolution,
-            targetHeight: resPreset?.maxHeight || undefined,
+            targetHeight: getTargetHeight(),
         }
     };
 
     worker.postMessage(message);
+}
+
+function cancelRecording(): void {
+    Alpine.store('state', 'loading');
+    Alpine.store('loading_message', 'Stopping...');
+    worker.postMessage({ cmd: 'cancel' } satisfies WorkerRequestMessage);
 }
 
 /**

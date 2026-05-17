@@ -15,8 +15,14 @@ This directory contains ONNX model files for video upscaling. Models are auto-do
 | `realesrgan-anime-plus` | Real-ESRGAN Anime Plus | 4x | ✅ Auto-download | High quality anime upscaling |
 | `realesrgan-general-fast` | Real-ESRGAN General Fast | 4x | ⏳ Coming Soon | Fast general content upscaling |
 | `realesrgan-general-plus` | Real-ESRGAN General Plus | 4x | ⏳ Coming Soon | High quality general upscaling |
-| `realcugan-2x` | Real-CUGAN 2x | 2x | ⏳ Coming Soon | Conservative anime with denoising |
+| `realcugan-2x` | Real-CUGAN 2x | 2x | ✅ Auto-download | Conservative anime with denoising |
 | `realcugan-4x` | Real-CUGAN 4x | 4x | ⏳ Coming Soon | High quality anime with denoising |
+| `realplksr-deh264-1x` | RealPLKSR DeH264 1x | 1x | ✅ Auto-download | Same-resolution H.264 artifact cleanup |
+| `realplksr-dejpg-1x` | RealPLKSR DeJPG 1x | 1x | ✅ Auto-download | Same-resolution JPEG/block cleanup |
+| `realplksr-denoise-1x` | RealPLKSR Denoise 1x | 1x | ✅ Auto-download | Same-resolution general denoising |
+| `scunet-psnr` | SCUNet PSNR 1x | 1x | ✅ Auto-download | Conservative blind denoising |
+| `scunet-gan` | SCUNet GAN 1x | 1x | ✅ Auto-download | Stronger blind denoising |
+| `swinir-jpeg40-1x` | SwinIR JPEG40 1x | 1x | ✅ Local | Same-resolution JPEG artifact and ringing cleanup |
 
 ## Auto-Download Sources
 
@@ -25,6 +31,8 @@ Models are downloaded from Hugging Face and cached in IndexedDB:
 - **RealESR AnimeVideo v3**: [xiongjie/lightweight-real-ESRGAN-anime](https://huggingface.co/xiongjie/lightweight-real-ESRGAN-anime)
 - **Real-ESRGAN Anime**: [deepghs/imgutils-models](https://huggingface.co/deepghs/imgutils-models)
 - **Real-ESRGAN General**: [qualcomm/Real-ESRGAN-x4plus](https://huggingface.co/qualcomm/Real-ESRGAN-x4plus)
+- **Real-CUGAN, RealPLKSR, SCUNet**: [hugglyberry/upscale-and-refine-models](https://huggingface.co/hugglyberry/upscale-and-refine-models)
+- **SwinIR JPEG**: converted locally from [deepinv/swinir](https://huggingface.co/deepinv/swinir) weights using `scripts/convert_swinir_jpeg_to_onnx.py`
 
 ## Converting Models
 
@@ -83,5 +91,5 @@ Real-CUGAN uses a different architecture (CUGAN) that requires additional setup.
 
 - Models are cached in IndexedDB after first download
 - WebGPU provides best performance; WASM fallback available
-- Model sizes: ~5-67 MB depending on architecture
+- Model sizes: ~96 KB-91 MB depending on architecture
 - Clear browser cache to re-download models
