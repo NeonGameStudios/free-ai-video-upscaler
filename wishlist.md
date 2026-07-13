@@ -82,29 +82,50 @@ The generated model is fixed at 126x126 float32 NCHW input/output, uses JPEG qua
 
 Benchmark this against `RealPLKSR DeJPG 1x`, `RealPLKSR DeH264 1x`, and `Real-CUGAN 2x` denoise level 1 before making it a default recommendation.
 
+### 14. Adaptive Tiling And Stage Benchmarks
+
+The renderer now computes a uniform tile shape per axis, with explicit edge
+coverage and overlap. This keeps ONNX input shapes stable while avoiding the
+old clamped final-tile inference. `benchmark:tiling` checks coverage and
+reports inferred-pixel reductions for 360p, 720p, and 1080p cases.
+
+Worker timing messages now average decode, audio, preprocess, inference,
+postprocess, canvas, encode, and total frame time, along with tile and pixel
+counts.
+
+### 15. GPU-Resident Float32 Interop
+
+Dynamic float32 models can use a separate WebGPU canvas for external-image
+upload, WGSL NCHW preprocessing, `Tensor.fromGpuBuffer`, GPU-resident ONNX
+outputs, WGSL postprocessing, and GPU tile compositing. The public 2D canvas
+is updated once per frame for preview and encoding compatibility. A failed
+interop step disposes the bridge and falls back to the CPU-tiled renderer.
+
+AnimeJaNai float16 graphs now attempt WebGPU after a PRelu-to-primitive rewrite,
+but remain explicitly experimental: WebGPU validation failures use the
+original model through WASM. `verify:onnx-rewrite` covers every local
+AnimeJaNai model.
+
 ## Remaining
 
 ### 1. RVRT / VRT Temporal Video Restoration
 
 Investigate RVRT or VRT for temporal cleanup across multiple frames. This is deferred because these models need multi-frame input windows or recurrent state, which requires a different worker pipeline than the current frame-by-frame renderer.
 
-### 2. True End-to-End GPU Buffer Interop
+### 2. Full End-To-End Clip Encoding Benchmark
 
-The current architecture still reads canvas pixels into CPU typed arrays before creating ONNX tensors. True zero-copy would require stable ONNX Runtime Web APIs for sharing external `GPUBuffer` objects across custom preprocessing, ONNX inference, and canvas output.
-
-This should stay deferred until ONNX Runtime Web exposes and documents a reliable browser-side GPU buffer interop path for this use case.
-
-### 3. Test-Clip Benchmarking
-
-Once representative 360p VHS-quality clips are available locally, add a repeatable benchmark pass that records:
+The browser regression harness now decodes and upscales a bounded number of
+frames from `test-clips/BotsMaster-15sec.mp4`, records provider/tile/timing
+data, and rejects an empty pixel checksum. A longer full-output benchmark is
+still useful for recording:
 
 - model selected
 - input and output resolution
 - per-frame render time
 - total encode time
 - output file size
-- visual sanity checks for snow/corruption
+- visual sanity checks for snow/corruption across the complete encoded output
 
-### 4. Model/Content Recommendations
+### 3. Model/Content Recommendations
 
 After testing real clips, document which available model works best for noisy VHS-style footage. Anime-focused models may not be ideal for live-action VHS restoration, so this needs evidence from the local test clips rather than assumptions.

@@ -20,10 +20,12 @@ import {
   WebMOutputFormat,
   AudioSampleSink,
   AudioSampleSource,
+  type AudioSample,
   EncodedAudioPacketSource,
   EncodedPacketSink,
   EncodedPacket,
   type AudioCodec,
+  canEncodeVideo,
 } from 'mediabunny';
 
 import { Upscaler } from './upscaler';
@@ -36,6 +38,7 @@ import type {
   ProcessSettings,
   Resolution,
   OutputFormat,
+  FrameTiming,
 } from './types/worker-messages';
 
 // Worker state
@@ -246,6 +249,37 @@ function getCodec(format: OutputFormat): 'avc' | 'vp9' | 'hevc' | 'av1' | 'vp8' 
 }
 
 /**
+ * Prefer the hardware video encoder on Macs when the browser advertises a
+ * compatible configuration, but retain MediaBunny's normal software path as
+ * a fallback.  Calling canEncodeVideo here avoids making an unsupported
+ * `hardwareAcceleration: 'prefer-hardware'` configuration fail the whole job
+ * during Output.start().
+ */
+async function getHardwareAcceleration(
+  codec: 'avc' | 'vp9' | 'hevc' | 'av1' | 'vp8',
+  width: number,
+  height: number,
+): Promise<'prefer-hardware' | 'no-preference'> {
+  try {
+    const supported = await canEncodeVideo(codec, {
+      width,
+      height,
+      bitrate: QUALITY_HIGH,
+      hardwareAcceleration: 'prefer-hardware',
+    });
+
+    if (supported) return 'prefer-hardware';
+  } catch (error) {
+    // Encoding support is still checked by MediaBunny when the first frame is
+    // submitted.  Treat a probe failure as a normal software fallback rather
+    // than making a platform-specific capability check fatal.
+    console.debug('Hardware encoder probe failed; using browser default:', error);
+  }
+
+  return 'no-preference';
+}
+
+/**
  * Get MIME type for format.
  */
 function getMimeType(format: OutputFormat): string {
@@ -401,9 +435,10 @@ async function initRecording(
   let audioPacketSource: EncodedAudioPacketSource | null = null;
   let audioPacketSourceClosed = false;
   let videoSource: CanvasSource | null = null;
-  let outputStarted = false;
+  let output: Output | null = null;
   let outputFinalized = false;
   let wasCancelled = false;
+  let pendingAudioSample: AudioSample | null = null;
 
   try {
     // Get the file from handle or use provided file directly (for remuxed MKV)
@@ -431,13 +466,15 @@ async function initRecording(
     let target: BufferTarget | StreamTarget;
     if (outputHandle) {
       writable = await outputHandle.createWritable();
-      target = new StreamTarget(writable);
+      // Coalesce writes into large chunks so the File System Access stream
+      // does not receive one tiny write per muxer packet.
+      target = new StreamTarget(writable, { chunked: true });
     } else {
       target = new BufferTarget();
     }
 
     const outputFormat = getOutputFormat(settings.outputFormat);
-    const output = new Output({
+    output = new Output({
       format: outputFormat,
       target: target,
     });
@@ -464,17 +501,30 @@ async function initRecording(
       : null;
     const inferenceCtx = inferenceCanvas?.getContext('2d', { alpha: false }) || null;
 
+    const codec = getCodec(settings.outputFormat);
+    const hardwareAcceleration = await getHardwareAcceleration(
+      codec,
+      encodeResolution.width,
+      encodeResolution.height,
+    );
+
     videoSource = new CanvasSource(encodeCanvas, {
-      codec: getCodec(settings.outputFormat),
+      codec,
       bitrate: QUALITY_HIGH,
       keyFrameInterval: 60,
+      hardwareAcceleration,
     });
 
-    output.addVideoTrack(videoSource, { frameRate: 30 });
+    // Preserve the source sample timestamps/durations instead of snapping all
+    // output to a hard-coded 30 fps.  This avoids silently dropping temporal
+    // detail from 60 fps input and lets MediaBunny derive the encoder cadence
+    // from the frames we actually submit.
+    output.addVideoTrack(videoSource);
 
     // Set up audio passthrough
     const audioTrack = await input.getPrimaryAudioTrack();
     let audioSink: AudioSampleSink | null = null;
+    let audioSampleIterator: AsyncIterator<AudioSample> | null = null;
     let audioPacketIterator: AsyncIterator<EncodedPacket> | null = null;
     let pendingAudioPacket: EncodedPacket | null = null;
     let audioPacketMeta: EncodedAudioChunkMetadata | undefined;
@@ -502,12 +552,15 @@ async function initRecording(
         });
         output.addAudioTrack(audioSource);
         audioSink = new AudioSampleSink(audioTrack);
+        // Keep one decoder-backed iterator alive for the whole job. Creating
+        // a new samples() generator for every video frame repeatedly seeks or
+        // reinitializes the audio decoder on incompatible-container jobs.
+        audioSampleIterator = audioSink.samples(0, Number.POSITIVE_INFINITY)[Symbol.asyncIterator]();
         console.log(`Re-encoding audio to ${audioCodec}`);
       }
     }
 
     await output.start();
-    outputStarted = true;
 
     const videoTrack = await input.getPrimaryVideoTrack();
 
@@ -532,9 +585,51 @@ async function initRecording(
     const duration = await input.computeDuration();
     const start_time = performance.now();
     let lastProgress = -1;
+    let lastEta = '';
+    let lastEtaAt = -Infinity;
 
     // Track audio progress separately
-    let lastAudioTimestamp = 0;
+    const timingTotals: FrameTiming = {
+      decodeMs: 0,
+      audioMs: 0,
+      preprocessMs: 0,
+      inferenceMs: 0,
+      postprocessMs: 0,
+      canvasMs: 0,
+      encodeMs: 0,
+      totalMs: 0,
+      tileCount: 0,
+      inputPixels: 0,
+      inferredPixels: 0,
+      frames: 0,
+    };
+
+    function reportTiming(frameTiming: FrameTiming): void {
+      for (const key of Object.keys(timingTotals) as Array<keyof FrameTiming>) {
+        timingTotals[key] += frameTiming[key];
+      }
+
+      if (timingTotals.frames % 30 === 0) {
+        const frames = timingTotals.frames;
+        postMessage({
+          cmd: 'timing',
+          data: {
+            ...timingTotals,
+            decodeMs: timingTotals.decodeMs / frames,
+            audioMs: timingTotals.audioMs / frames,
+            preprocessMs: timingTotals.preprocessMs / frames,
+            inferenceMs: timingTotals.inferenceMs / frames,
+            postprocessMs: timingTotals.postprocessMs / frames,
+            canvasMs: timingTotals.canvasMs / frames,
+            encodeMs: timingTotals.encodeMs / frames,
+            totalMs: timingTotals.totalMs / frames,
+            tileCount: timingTotals.tileCount / frames,
+            inputPixels: timingTotals.inputPixels / frames,
+            inferredPixels: timingTotals.inferredPixels / frames,
+          },
+        } satisfies WorkerResponseMessage);
+      }
+    }
 
     function reportProgress(sample: VideoSample) {
       const time_elapsed = performance.now() - start_time;
@@ -547,12 +642,23 @@ async function initRecording(
         lastProgress = progress;
       }
 
+      let etaMessage: string;
       if (time_elapsed > 1000 && percentComplete > 0) {
         const processing_rate = percentComplete / time_elapsed;
         const eta = Math.max(0, Math.round(((100 - percentComplete) / processing_rate) / 1000));
-        postMessage({ cmd: 'eta', data: prettyTime(eta) });
+        etaMessage = prettyTime(eta);
       } else {
-        postMessage({ cmd: 'eta', data: 'calculating...' });
+        etaMessage = 'calculating...';
+      }
+
+      // ETA is informational and can be updated at a much lower cadence than
+      // frame processing. Avoid posting one message for every decoded frame,
+      // especially on high-FPS sources.
+      const etaNow = performance.now();
+      if (etaMessage !== lastEta || etaNow - lastEtaAt >= 250) {
+        postMessage({ cmd: 'eta', data: etaMessage });
+        lastEta = etaMessage;
+        lastEtaAt = etaNow;
       }
     }
 
@@ -592,11 +698,23 @@ async function initRecording(
 
       if (!audioSink || !audioSource) return;
 
-      // Get audio samples up to this video frame's timestamp
-      for await (const audioSample of audioSink.samples(lastAudioTimestamp, timestamp)) {
+      // Consume the persistent audio iterator up to this video frame's timestamp.
+      while (audioSampleIterator) {
         throwIfCancelled();
+        if (!pendingAudioSample) {
+          const nextAudio = await audioSampleIterator.next();
+          if (nextAudio.done) {
+            audioSampleIterator = null;
+            break;
+          }
+          pendingAudioSample = nextAudio.value;
+        }
+
+        if (pendingAudioSample.timestamp >= timestamp) return;
+
+        const audioSample = pendingAudioSample;
+        pendingAudioSample = null;
         await audioSource.add(audioSample);
-        lastAudioTimestamp = audioSample.timestamp + audioSample.duration;
         audioSample.close();
       }
     }
@@ -605,13 +723,18 @@ async function initRecording(
     postMessage({ cmd: 'progress', data: 0 });
     for await (const sample of videoSink.samples()) {
       let videoFrame: VideoFrame | null = null;
+      const frameStarted = performance.now();
       try {
         throwIfCancelled();
 
         // Process audio up to this frame's timestamp
+        const audioStarted = performance.now();
         await processAudioUpTo(sample.timestamp + sample.duration);
+        const audioMs = performance.now() - audioStarted;
 
+        const decodeStarted = performance.now();
         videoFrame = sample.toVideoFrame();
+        const decodeMs = performance.now() - decodeStarted;
         throwIfCancelled();
 
         // Render through upscaler (skip "before" preview during processing for speed)
@@ -629,6 +752,7 @@ async function initRecording(
         }
         throwIfCancelled();
 
+        const encodeStarted = performance.now();
         if (encodeCtx) {
           encodeCtx.drawImage(
             upscaled_canvas,
@@ -642,6 +766,24 @@ async function initRecording(
         // Add frame to output video
         await videoSource.add(sample.timestamp, sample.duration);
         throwIfCancelled();
+
+        const upscaleTiming = upscaler.getLastTiming();
+        if (upscaleTiming) {
+          reportTiming({
+            decodeMs,
+            audioMs,
+            preprocessMs: upscaleTiming.preprocessMs,
+            inferenceMs: upscaleTiming.inferenceMs,
+            postprocessMs: upscaleTiming.postprocessMs,
+            canvasMs: upscaleTiming.canvasMs,
+            encodeMs: performance.now() - encodeStarted,
+            totalMs: performance.now() - frameStarted,
+            tileCount: upscaleTiming.tileCount,
+            inputPixels: upscaleTiming.inputPixels,
+            inferredPixels: upscaleTiming.inferredPixels,
+            frames: 1,
+          });
+        }
 
         reportProgress(sample);
       } finally {
@@ -668,6 +810,27 @@ async function initRecording(
     postMessage({ cmd: 'progress', data: 100 });
     postMessage({ cmd: 'eta', data: prettyTime(0) });
 
+    if (timingTotals.frames > 0 && timingTotals.frames % 30 !== 0) {
+      const frames = timingTotals.frames;
+      postMessage({
+        cmd: 'timing',
+        data: {
+          ...timingTotals,
+          decodeMs: timingTotals.decodeMs / frames,
+          audioMs: timingTotals.audioMs / frames,
+          preprocessMs: timingTotals.preprocessMs / frames,
+          inferenceMs: timingTotals.inferenceMs / frames,
+          postprocessMs: timingTotals.postprocessMs / frames,
+          canvasMs: timingTotals.canvasMs / frames,
+          encodeMs: timingTotals.encodeMs / frames,
+          totalMs: timingTotals.totalMs / frames,
+          tileCount: timingTotals.tileCount / frames,
+          inputPixels: timingTotals.inputPixels / frames,
+          inferredPixels: timingTotals.inferredPixels / frames,
+        },
+      } satisfies WorkerResponseMessage);
+    }
+
     if (writable) {
       postMessage({ cmd: 'finished', data: null }, []);
     } else {
@@ -687,17 +850,21 @@ async function initRecording(
       data: `Video processing failed: ${e}`
     } satisfies WorkerResponseMessage);
   } finally {
-    if (cancelRequested) {
+    // Always release encoder/source resources on both cancellation and errors.
+    // Previously this branch only ran for explicit cancellation, leaving a
+    // failed encode (and, for file-backed output, its writable stream) alive
+    // until the worker was torn down.
+    if (!outputFinalized) {
       try {
         videoSource?.close();
       } catch {
-        // Ignore close errors after cancellation.
+        // Ignore close errors while unwinding a failed/cancelled encode.
       }
 
       try {
         audioSource?.close();
       } catch {
-        // Ignore close errors after cancellation.
+        // Ignore close errors while unwinding a failed/cancelled encode.
       }
 
       if (audioPacketSource && !audioPacketSourceClosed) {
@@ -705,20 +872,33 @@ async function initRecording(
           audioPacketSource.close();
           audioPacketSourceClosed = true;
         } catch {
-          // Ignore close errors after cancellation.
+          // Ignore close errors while unwinding a failed/cancelled encode.
         }
       }
 
-      if (outputStarted && !outputFinalized) {
+      // Abort a file-backed target rather than committing a partial output.
+      // BufferTarget has no external resource and is released with the output
+      // object once this job returns.
+      if (writable) {
         try {
-          await writable?.abort();
+          await writable.abort();
         } catch {
-          // Ignore writer abort errors after cancellation.
+          // Ignore writer abort errors after cancellation/error.
+        }
+      }
+
+      if (output && output.state !== 'canceled' && output.state !== 'finalized') {
+        try {
+          await output.cancel();
+        } catch {
+          // Ignore output cancellation errors while unwinding.
         }
       }
     }
 
     cancelRequested = false;
+    pendingAudioSample?.close();
+    pendingAudioSample = null;
     upscaler?.clearFrameResources();
     input?.dispose();
 

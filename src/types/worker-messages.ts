@@ -10,6 +10,21 @@ export interface Resolution {
   height: number;
 }
 
+export interface FrameTiming {
+  decodeMs: number;
+  audioMs: number;
+  preprocessMs: number;
+  inferenceMs: number;
+  postprocessMs: number;
+  canvasMs: number;
+  encodeMs: number;
+  totalMs: number;
+  tileCount: number;
+  inputPixels: number;
+  inferredPixels: number;
+  frames: number;
+}
+
 // Available upscaling models
 export type ModelType =
   | 'realesr-animevideov3'
@@ -285,6 +300,7 @@ export type WorkerResponseMessage =
   | { cmd: 'status'; data: string }
   | { cmd: 'modelLoaded' }
   | { cmd: 'progress'; data: number }
+  | { cmd: 'timing'; data: FrameTiming }
   | { cmd: 'eta'; data: string }
   | { cmd: 'process' }
   | { cmd: 'cancelled' }

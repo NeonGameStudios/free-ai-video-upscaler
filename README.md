@@ -70,7 +70,40 @@ The dev server runs at `http://localhost:8080`. Open in Chrome/Safari to use Web
 ### Browser Requirements
 
 - **Recommended**: Chrome/Edge with WebGPU support (best performance)
-- **Fallback**: Any modern browser with WebAssembly support
+- **Fallback**: Any modern browser with WebAssembly support. The app validates
+  the selected ONNX execution provider and falls back to WASM when WebGPU or
+  a model graph is unsupported.
+
+## Performance checks
+
+The renderer uses an adaptive, overlap-aware tile plan so edge tiles do not
+repeat a full maximum-size inference. It also reports averaged decode,
+preprocess, inference, postprocess, canvas, and encode timings in the worker's
+diagnostic `timing` message.
+
+```bash
+# Check the adaptive tile plan against representative frame sizes
+npm run benchmark:tiling
+
+# Verify the AnimeJaNai PRelu graph rewrite used by the experimental WebGPU path
+npm run verify:onnx-rewrite
+
+# Build a small browser WebGPU smoke benchmark, then serve dist/ on port 8080
+npm run benchmark:webgpu
+
+# Decode and upscale six frames from test-clips/BotsMaster-15sec.mp4
+npm run benchmark:clip
+```
+
+The two browser benchmarks emit `gpu-benchmark.js` and `clip-regression.js`;
+load their corresponding temporary HTML pages from the development server.
+
+AnimeJaNai float16 WebGPU is deliberately experimental: the graph rewrite is
+validated structurally, but browsers/ONNX Runtime builds that cannot execute
+the rewritten graph automatically use the original model through WASM. The
+default float32 models use the GPU-buffer path when ONNX Runtime returns a
+GPU-resident output; any interop failure falls back to the existing CPU-tiled
+renderer for correctness.
 
 ## Model Conversion
 

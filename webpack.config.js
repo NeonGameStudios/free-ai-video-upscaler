@@ -1,17 +1,32 @@
 const path = require('path');
-const webpack = require('webpack');
 
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 const { CleanWebpackPlugin } = require('clean-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 
 
-module.exports = {
-    entry: ["./src/index.ts", './src/worker.ts'],
+/**
+ * Webpack is invoked by both `webpack` (production) and `webpack serve`
+ * (development).  Keeping the mode in the CLI scripts means webpack can
+ * apply the correct optimisations without baking development defaults into
+ * production builds.
+ */
+module.exports = (env, argv = {}) => {
+    const mode = argv.mode || process.env.NODE_ENV || 'development';
+    const isProduction = mode === 'production';
+
+    return {
+    // `worker.ts` is discovered by the Worker(new URL(...)) expression in
+    // index.ts.  Listing it here as a second entry compiled the worker twice
+    // and emitted an unnecessary copy in the main bundle.
+    entry: './src/index.ts',
     output: {
         libraryExport: "default",
         path: path.resolve(__dirname, './dist'),
-        filename: "main.js"
+        filename: "main.js",
+        // Worker child compilations and any future async imports get a
+        // deterministic filename instead of colliding with main.js.
+        chunkFilename: "[name].js",
     },
     module: {
 
@@ -105,9 +120,12 @@ module.exports = {
     ],
 
     devServer: {
-        static: {
-            directory: path.join(__dirname, 'dist'),
-        },
+        static: [
+            { directory: path.join(__dirname, 'dist') },
+            // Keep local regression clips available to the optional benchmark
+            // page without copying them into production builds.
+            { directory: path.join(__dirname, 'test-clips'), publicPath: '/test-clips' },
+        ],
         compress: true,
         host: '0.0.0.0',  // Listen on all interfaces (required for Docker)
         port: 8080,
@@ -127,6 +145,16 @@ module.exports = {
         },
     },
 
-    mode: 'development'
-
+    mode,
+    // Source maps are useful while iterating locally but add a large amount
+    // of startup/download work to the deployed bundle.
+    devtool: isProduction ? false : 'eval-cheap-module-source-map',
+    optimization: {
+        // Production mode enables minification and tree-shaking.  Explicitly
+        // retaining these defaults documents the intended build behaviour.
+        minimize: isProduction,
+        moduleIds: 'deterministic',
+        chunkIds: 'deterministic',
+    },
+    };
 };

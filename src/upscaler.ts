@@ -8,8 +8,10 @@
  */
 
 import * as ort from 'onnxruntime-web';
-import type { DenoiseLevel, ModelType } from './types/worker-messages';
+import type { DenoiseLevel, FrameTiming, ModelType } from './types/worker-messages';
 import { loadModel, type LoadedModel, type LoadProgressCallback } from './model-loader';
+import { calculateTilePlan } from './tiling';
+import { GPUFrameRenderer, type GPUFrameTile } from './webgpu-utils';
 
 type UpscaleSource = ImageBitmap | VideoFrame | OffscreenCanvas;
 
@@ -90,6 +92,8 @@ export interface UpscalerConfig {
   denoiseLevel?: DenoiseLevel;
 }
 
+export type UpscaleTiming = Omit<FrameTiming, 'decodeMs' | 'audioMs' | 'encodeMs' | 'totalMs' | 'frames'>;
+
 // Default configuration
 const DEFAULT_CONFIG: UpscalerConfig = {
   modelId: 'realesr-animevideov3',
@@ -122,6 +126,8 @@ export class Upscaler {
   private inputFloat32: Float32Array | null = null;
   private inputFloat16: Uint16Array | null = null;
   private outputImageData: ImageData | null = null;
+  private lastTiming: UpscaleTiming | null = null;
+  private gpuRenderer: GPUFrameRenderer | null = null;
 
   constructor(config: Partial<UpscalerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -190,8 +196,22 @@ export class Upscaler {
       // Download or retrieve model from cache
       onProgress?.(0, 'Loading model...');
       const loadedModel = await loadModel(this.config.modelId, onProgress, this.config.denoiseLevel);
+      let webGPUModel = loadedModel;
+      if (this.useFloat16 && this.useWebGPU) {
+        // Keep protobufjs and the graph-rewrite code out of the default
+        // startup bundle. It is only needed for the experimental AnimeJaNai
+        // WebGPU attempt; normal float32 models should not pay that cost.
+        const { rewritePReluForWebGPU } = await import('./onnx-webgpu-compat');
+        const rewritten = rewritePReluForWebGPU(loadedModel.data);
+        if (rewritten.rewrittenNodes > 0) {
+          console.log(`Rewrote ${rewritten.rewrittenNodes} PRelu nodes for WebGPU`);
+          webGPUModel = { ...loadedModel, data: rewritten.data };
+        }
+      }
 
-      const canTryWebGPU = this.useWebGPU && !this.useFloat16;
+      // Float16 models are attempted on WebGPU too. If the graph or browser
+      // cannot execute them, the validated session path falls back to WASM.
+      const canTryWebGPU = this.useWebGPU;
       const providerCandidates: ('webgpu' | 'wasm')[] = canTryWebGPU
         ? ['webgpu', 'wasm']
         : ['wasm'];
@@ -201,7 +221,10 @@ export class Upscaler {
       for (const provider of providerCandidates) {
         try {
           onProgress?.(100, `Initializing model with ${provider.toUpperCase()}...`);
-          this.session = await this.createValidatedSession(loadedModel, provider);
+          this.session = await this.createValidatedSession(
+            provider === 'webgpu' ? webGPUModel : loadedModel,
+            provider
+          );
           this.executionProvider = provider;
           break;
         } catch (e) {
@@ -232,7 +255,20 @@ export class Upscaler {
 
     // Set up output canvas
     this.canvas = outputCanvas;
-    this.ctx = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+    this.ctx = outputCanvas.getContext('2d', { alpha: false }) as OffscreenCanvasRenderingContext2D;
+
+    // The GPU bridge currently supports dynamic float32 models only. Models
+    // with fixed or padded input shapes stay on the verified CPU path until
+    // their shader padding and compositing paths are validated.
+    if (
+      this.executionProvider === 'webgpu' &&
+      !this.useFloat16 &&
+      !this.config.inputWidth &&
+      !this.config.inputHeight &&
+      (this.config.inputMultiple || 1) <= 1
+    ) {
+      this.gpuRenderer = await GPUFrameRenderer.create(this.session, this.config.scale);
+    }
 
     this.initialized = true;
 
@@ -252,6 +288,10 @@ export class Upscaler {
         : ['wasm'],
       graphOptimizationLevel: 'all',
     };
+
+    if (provider === 'webgpu') {
+      sessionOptions.preferredOutputLocation = 'gpu-buffer';
+    }
 
     if (loadedModel.externalData?.length) {
       sessionOptions.externalData = loadedModel.externalData.map(({ path, data }) => ({ path, data }));
@@ -290,11 +330,12 @@ export class Upscaler {
         throw new Error('Validation inference produced no output tensor');
       }
 
+      const validationData = await this.getTensorData(output);
       if (this.useFloat16) {
-        this.outputDataIsFloat32 = output.data instanceof Float32Array;
+        this.outputDataIsFloat32 = validationData instanceof Float32Array;
       }
 
-      if (!this.hasUsableOutput(output)) {
+      if (!this.hasUsableOutput(validationData)) {
         throw new Error('Validation inference produced unusable output');
       }
     } finally {
@@ -324,8 +365,7 @@ export class Upscaler {
     return data;
   }
 
-  private hasUsableOutput(output: ort.Tensor): boolean {
-    const data = output.data as Float32Array | Uint16Array;
+  private hasUsableOutput(data: Float32Array | Uint16Array): boolean {
     const length = Math.min(data.length, 4096);
     let max = -Infinity;
     let min = Infinity;
@@ -357,6 +397,8 @@ export class Upscaler {
     onProgress?: LoadProgressCallback
   ): Promise<void> {
     // Dispose current session
+    this.gpuRenderer?.dispose();
+    this.gpuRenderer = null;
     if (this.session) {
       await this.session.release();
       this.session = null;
@@ -528,14 +570,15 @@ export class Upscaler {
    * Postprocess model output to ImageData.
    * Converts tensor (float32 or float16) back to RGBA pixels.
    */
-  private postprocess(
+  private async postprocess(
     output: ort.Tensor,
     inputWidth: number,
     inputHeight: number
-  ): ImageData {
+  ): Promise<ImageData> {
     const outputHeight = (output.dims[2] as number) || inputHeight * this.config.scale;
     const outputWidth = (output.dims[3] as number) || inputWidth * this.config.scale;
     const planeSize = outputHeight * outputWidth;
+    const data = await this.getTensorData(output);
 
     if (!this.outputImageData ||
         this.outputImageData.width !== outputWidth ||
@@ -546,8 +589,6 @@ export class Upscaler {
     const pixels = this.outputImageData.data;
 
     if (this.useFloat16) {
-      const data = output.data as Float32Array | Uint16Array;
-
       if (data instanceof Uint16Array) {
         for (let i = 0, p = 0; i < planeSize; i++, p += 4) {
           pixels[p] = FLOAT16_TO_BYTE[data[i]];
@@ -568,7 +609,6 @@ export class Upscaler {
         }
       }
     } else {
-      const data = output.data as Float32Array;
       for (let i = 0, p = 0; i < planeSize; i++, p += 4) {
         const r = data[i];
         const g = data[planeSize + i];
@@ -582,6 +622,13 @@ export class Upscaler {
     }
 
     return this.outputImageData;
+  }
+
+  private async getTensorData(output: ort.Tensor): Promise<Float32Array | Uint16Array> {
+    if (output.location !== 'cpu') {
+      return await output.getData() as Float32Array | Uint16Array;
+    }
+    return output.data as Float32Array | Uint16Array;
   }
 
   /**
@@ -622,76 +669,165 @@ export class Upscaler {
     }
 
     const { tileSize, tilePadding, scale } = this.config;
+    const timing: UpscaleTiming = {
+      preprocessMs: 0,
+      inferenceMs: 0,
+      postprocessMs: 0,
+      canvasMs: 0,
+      tileCount: 0,
+      inputPixels: inputWidth * inputHeight,
+      inferredPixels: 0,
+    };
+    const now = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+    const tilePlan = calculateTilePlan(inputWidth, inputHeight, tileSize, tilePadding);
+    const tilesX = tilePlan.x.count;
+    const tilesY = tilePlan.y.count;
+    const getTile = (tx: number, ty: number): GPUFrameTile => {
+      const sourceX = Math.min(
+        tx * tilePlan.x.step,
+        Math.max(0, inputWidth - tilePlan.x.tileSize)
+      );
+      const sourceY = Math.min(
+        ty * tilePlan.y.step,
+        Math.max(0, inputHeight - tilePlan.y.tileSize)
+      );
+      const inputTileWidth = tilePlan.x.tileSize;
+      const inputTileHeight = tilePlan.y.tileSize;
+      const effectivePaddingX = Math.min(tilePadding, Math.floor(tilePlan.overlap / 2));
+      const effectivePaddingY = Math.min(tilePadding, Math.floor(tilePlan.overlap / 2));
+      const isLeftEdge = sourceX === 0;
+      const isTopEdge = sourceY === 0;
+      const isRightEdge = sourceX + inputTileWidth >= inputWidth;
+      const isBottomEdge = sourceY + inputTileHeight >= inputHeight;
+      const keepStartX = isLeftEdge ? 0 : effectivePaddingX * scale;
+      const keepStartY = isTopEdge ? 0 : effectivePaddingY * scale;
+      const keepEndX = isRightEdge
+        ? inputTileWidth * scale
+        : (inputTileWidth - effectivePaddingX) * scale;
+      const keepEndY = isBottomEdge
+        ? inputTileHeight * scale
+        : (inputTileHeight - effectivePaddingY) * scale;
+
+      return {
+        sourceX,
+        sourceY,
+        inputWidth: inputTileWidth,
+        inputHeight: inputTileHeight,
+        destinationX: sourceX * scale,
+        destinationY: sourceY * scale,
+        keepStartX,
+        keepStartY,
+        keepWidth: keepEndX - keepStartX,
+        keepHeight: keepEndY - keepStartY,
+      };
+    };
+
+    if (this.gpuRenderer) {
+      const gpuTiles: GPUFrameTile[] = [];
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          gpuTiles.push(getTile(tx, ty));
+        }
+      }
+
+      try {
+        await this.gpuRenderer.render(
+          source,
+          this.canvas,
+          outputWidth,
+          outputHeight,
+          gpuTiles
+        );
+        const gpuTiming = this.gpuRenderer.getLastTiming();
+        timing.preprocessMs = gpuTiming.preprocessMs;
+        timing.inferenceMs = gpuTiming.inferenceMs;
+        timing.postprocessMs = gpuTiming.postprocessMs;
+        timing.canvasMs = gpuTiming.canvasMs;
+        timing.tileCount = gpuTiles.length;
+        timing.inferredPixels = gpuTiles.reduce(
+          (total, tile) => total + tile.inputWidth * tile.inputHeight,
+          0
+        );
+        this.lastTiming = timing;
+        return;
+      } catch (error) {
+        console.warn('GPU tiled render failed; falling back to CPU path:', error);
+        this.gpuRenderer.dispose();
+        this.gpuRenderer = null;
+      }
+    }
 
     // For small images, process in one go
     if (inputWidth <= tileSize && inputHeight <= tileSize) {
       let tensor: ort.Tensor | null = null;
       let output: ort.Tensor | null = null;
       try {
+        const preprocessStarted = now();
         const preprocessed = await this.preprocess(source);
+        timing.preprocessMs += now() - preprocessStarted;
         tensor = preprocessed.tensor;
+        const inferenceStarted = now();
         output = await this.upscaleTile(tensor);
-        const imageData = this.postprocess(output, inputWidth, inputHeight);
+        timing.inferenceMs += now() - inferenceStarted;
+        timing.inferredPixels += inputWidth * inputHeight;
+        const postprocessStarted = now();
+        const imageData = await this.postprocess(output, inputWidth, inputHeight);
+        timing.postprocessMs += now() - postprocessStarted;
+        const canvasStarted = now();
         this.ctx.putImageData(imageData, 0, 0);
+        timing.canvasMs += now() - canvasStarted;
+        timing.tileCount = 1;
       } finally {
         tensor?.dispose();
         output?.dispose();
       }
+      this.lastTiming = timing;
       return;
     }
 
-    // Tiled processing for larger images
-    // Use overlap to ensure seamless blending
-    const overlap = Math.min(tilePadding * 2, tileSize - 1);
-    const step = tileSize - overlap;
-    const tilesX = inputWidth <= tileSize ? 1 : Math.ceil((inputWidth - overlap) / step);
-    const tilesY = inputHeight <= tileSize ? 1 : Math.ceil((inputHeight - overlap) / step);
-
+    // Tiled processing for larger images. Use one stable, adaptive tile shape
+    // per axis so remainder tiles do not get clamped back to full size.
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
         let tensor: ort.Tensor | null = null;
         let output: ort.Tensor | null = null;
 
         try {
-          // Calculate source position (where to extract from input)
-          const srcX = tx * step;
-          const srcY = ty * step;
-
-          // Clamp to input boundaries
-          const actualSrcX = inputWidth <= tileSize ? 0 : Math.min(srcX, inputWidth - tileSize);
-          const actualSrcY = inputHeight <= tileSize ? 0 : Math.min(srcY, inputHeight - tileSize);
-
-          // Handle small images or last tiles
-          const srcW = Math.min(tileSize, inputWidth - actualSrcX);
-          const srcH = Math.min(tileSize, inputHeight - actualSrcY);
+          const tile = getTile(tx, ty);
+          const actualSrcX = tile.sourceX;
+          const actualSrcY = tile.sourceY;
+          const srcW = tile.inputWidth;
+          const srcH = tile.inputHeight;
 
           // Process tile directly from the source frame to avoid extra canvas/bitmap copies.
+          const preprocessStarted = now();
           const preprocessed = await this.preprocess(source, actualSrcX, actualSrcY, srcW, srcH);
+          timing.preprocessMs += now() - preprocessStarted;
           tensor = preprocessed.tensor;
+          const inferenceStarted = now();
           output = await this.upscaleTile(tensor);
-          const outputImageData = this.postprocess(output, srcW, srcH);
+          timing.inferenceMs += now() - inferenceStarted;
+          timing.inferredPixels += srcW * srcH;
+          const postprocessStarted = now();
+          const outputImageData = await this.postprocess(output, srcW, srcH);
+          timing.postprocessMs += now() - postprocessStarted;
 
           // Calculate destination position in output
           const dstX = actualSrcX * scale;
           const dstY = actualSrcY * scale;
 
-          // For interior tiles, we only keep the center region (excluding overlap)
-          // For edge tiles, we keep more
-          const isLeftEdge = (actualSrcX === 0);
-          const isTopEdge = (actualSrcY === 0);
-          const isRightEdge = (actualSrcX + srcW >= inputWidth);
-          const isBottomEdge = (actualSrcY + srcH >= inputHeight);
-
-          // Calculate which region of the output tile to keep
-          const keepStartX = isLeftEdge ? 0 : tilePadding * scale;
-          const keepStartY = isTopEdge ? 0 : tilePadding * scale;
-          const keepEndX = isRightEdge ? srcW * scale : (srcW - tilePadding) * scale;
-          const keepEndY = isBottomEdge ? srcH * scale : (srcH - tilePadding) * scale;
-          const keepW = keepEndX - keepStartX;
-          const keepH = keepEndY - keepStartY;
+          // Keep exactly the same overlap crop as the GPU compositor. The
+          // effective padding is clamped by the tile planner for tiny/fixed
+          // model shapes, so it can never produce a negative dirty rectangle.
+          const keepStartX = tile.keepStartX;
+          const keepStartY = tile.keepStartY;
+          const keepW = tile.keepWidth;
+          const keepH = tile.keepHeight;
 
           // putImageData applies dirtyX/dirtyY on top of dx/dy, so dx/dy must be
           // the full tile origin rather than the cropped region origin.
+          const canvasStarted = now();
           this.ctx.putImageData(
             outputImageData,
             dstX,
@@ -701,6 +837,8 @@ export class Upscaler {
             keepW,
             keepH
           );
+          timing.canvasMs += now() - canvasStarted;
+          timing.tileCount += 1;
         } finally {
           // Cleanup - always dispose even on error
           tensor?.dispose();
@@ -708,6 +846,8 @@ export class Upscaler {
         }
       }
     }
+
+    this.lastTiming = timing;
   }
 
   /**
@@ -724,10 +864,24 @@ export class Upscaler {
     return this.initialized && this.session !== null;
   }
 
+  getLastTiming(): UpscaleTiming | null {
+    return this.lastTiming ? { ...this.lastTiming } : null;
+  }
+
+  getExecutionProvider(): 'webgpu' | 'wasm' {
+    return this.executionProvider;
+  }
+
+  isUsingGPUPath(): boolean {
+    return this.gpuRenderer !== null;
+  }
+
   /**
    * Dispose of resources.
    */
   async dispose(): Promise<void> {
+    this.gpuRenderer?.dispose();
+    this.gpuRenderer = null;
     if (this.session) {
       await this.session.release();
       this.session = null;
@@ -742,6 +896,7 @@ export class Upscaler {
     this.inputFloat32 = null;
     this.inputFloat16 = null;
     this.outputImageData = null;
+    this.lastTiming = null;
   }
 }
 

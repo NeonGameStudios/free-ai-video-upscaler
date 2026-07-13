@@ -60,6 +60,9 @@ let video: HTMLVideoElement;
 let previewBitmap: ImageBitmap | null = null;
 let videoObjectUrl: string | null = null;
 let downloadUrl: string | null = null;
+// Incremented whenever a new file is selected.  Preview callbacks can outlive
+// the video element that created them, so use this token to ignore stale work.
+let previewGeneration = 0;
 
 // Current settings
 let currentModel: ModelType = 'realesr-animevideov3';
@@ -370,10 +373,16 @@ function getPreviewTargetHeight(): number | undefined {
 }
 
 function clearMediaObjectUrls(): void {
+    previewGeneration += 1;
+
     previewBitmap?.close();
     previewBitmap = null;
 
     if (video) {
+        // Detach callbacks before clearing the source.  This avoids a queued
+        // `loadeddata` event from rendering a preview for the previous file.
+        video.onloadeddata = null;
+        video.onerror = null;
         video.pause();
         video.removeAttribute('src');
         video.load();
@@ -389,6 +398,29 @@ function clearMediaObjectUrls(): void {
         downloadUrl = null;
         Alpine.store('download_url', '');
     }
+
+    // A canvas can only be transferred to an OffscreenCanvas once.  Replace
+    // the DOM canvases between files so subsequent previews do not throw
+    // InvalidStateError, while releasing the old browser-side backing stores.
+    upscaled_canvas = replacePreviewCanvas(upscaled_canvas);
+    original_canvas = replacePreviewCanvas(original_canvas);
+
+    inputFileHandle = null;
+    inputFile = null;
+}
+
+function replacePreviewCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
+    if (!canvas?.parentNode) return canvas;
+
+    const replacement = canvas.cloneNode(false) as HTMLCanvasElement;
+    // Do not carry over a previous fullscreen size or a large content
+    // allocation. The worker sets the OffscreenCanvas dimensions during init.
+    replacement.removeAttribute('width');
+    replacement.removeAttribute('height');
+    replacement.style.width = '';
+    replacement.style.height = '';
+    canvas.replaceWith(replacement);
+    return replacement;
 }
 
 //===================  Preview ===========================
@@ -409,14 +441,12 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     // Set up initial filename (use base name, will add extension based on output format)
     Alpine.store('filename', originalFilename);
 
-    let arrayBuffer: ArrayBuffer;
-
     // Check if file needs remuxing (MKV -> MP4)
     if (needsRemux(originalFilename)) {
         Alpine.store('loading_message', 'Converting MKV to MP4...');
 
         try {
-            arrayBuffer = await remuxToMp4(file, (message) => {
+            const arrayBuffer = await remuxToMp4(file, (message) => {
                 Alpine.store('loading_message', message);
             });
 
@@ -433,44 +463,38 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
         // Store the original file handle for processing
         inputFileHandle = fileHandle;
         inputFile = null;
-        arrayBuffer = await file.arrayBuffer();
     }
 
     updateDownloadName();
-    await setupPreview(arrayBuffer);
+    // Keep normal files as Blob-backed object URLs.  Reading the complete
+    // file into an ArrayBuffer here duplicated potentially gigabytes of data
+    // before MediaBunny streamed it from the file handle during processing.
+    await setupPreview(inputFile || file);
 }
 
 /**
  * Set up the preview UI with before/after comparison.
  */
-async function setupPreview(data: ArrayBuffer): Promise<void> {
+async function setupPreview(data: Blob): Promise<void> {
+    const generation = previewGeneration;
     console.log('setupPreview called, creating video element');
     video = document.createElement('video');
     console.log('video element created:', video);
 
-    const fileBlob = new Blob([data], { type: "video/mp4" });
-
-    videoObjectUrl = URL.createObjectURL(fileBlob);
+    videoObjectUrl = URL.createObjectURL(data);
     video.src = videoObjectUrl;
 
     const imageCompare = document.getElementById('image-compare-outer') as HTMLElement;
 
     video.onloadeddata = async function () {
+        if (generation !== previewGeneration) return;
+
         console.log('video.onloadeddata fired, videoWidth:', video.videoWidth);
         Alpine.store('width', video.videoWidth);
         Alpine.store('height', video.videoHeight);
 
         // Update output dimensions
         updateOutputDimensions();
-
-        const modelInfo = getModelInfo(currentModel);
-        const scale = modelInfo?.scale || 4;
-
-        // Set canvas dimensions
-        upscaled_canvas.width = video.videoWidth * scale;
-        upscaled_canvas.height = video.videoHeight * scale;
-        original_canvas.width = video.videoWidth * scale;
-        original_canvas.height = video.videoHeight * scale;
 
         imageCompare.style.height = '318px';
         imageCompare.style.width = `${Math.round(video.videoWidth / video.videoHeight * 318)}px`;
@@ -488,13 +512,25 @@ async function setupPreview(data: ArrayBuffer): Promise<void> {
     };
 
     async function showPreview() {
+        if (generation !== previewGeneration) return;
+
         const fullScreenButton = document.getElementById('full-screen');
 
         window.initRecording = initRecording;
         window.fullScreenPreview = fullScreenPreview;
 
         // Store bitmap for model switching
-        previewBitmap = await createImageBitmap(video);
+        const bitmap = await createImageBitmap(video);
+
+        if (generation !== previewGeneration) {
+            // A newer file may already have installed its own preview bitmap;
+            // only close the bitmap created by this stale callback.
+            bitmap.close();
+            return;
+        }
+
+        previewBitmap?.close();
+        previewBitmap = bitmap;
 
         const upscaled = upscaled_canvas.transferControlToOffscreen();
         const original = original_canvas.transferControlToOffscreen();
@@ -660,6 +696,11 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
 
     } else if (event.data.cmd === 'eta') {
         Alpine.store('eta', event.data.data);
+
+    } else if (event.data.cmd === 'timing') {
+        // Keep the latest averaged stage timings available for diagnostics
+        // without updating the visible progress UI on every video frame.
+        Alpine.store('timing', event.data.data);
 
     } else if (event.data.cmd === 'finished') {
         Alpine.store('state', 'complete');

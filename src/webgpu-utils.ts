@@ -50,6 +50,321 @@ export interface GPUBufferPool {
   useFloat16: boolean;
 }
 
+export interface GPUFrameTile {
+  sourceX: number;
+  sourceY: number;
+  inputWidth: number;
+  inputHeight: number;
+  destinationX: number;
+  destinationY: number;
+  keepStartX: number;
+  keepStartY: number;
+  keepWidth: number;
+  keepHeight: number;
+}
+
+export interface GPUFrameTiming {
+  preprocessMs: number;
+  inferenceMs: number;
+  postprocessMs: number;
+  canvasMs: number;
+}
+
+/**
+ * Tiled WebGPU bridge for float32 ONNX models.
+ *
+ * The renderer deliberately owns a separate WebGPU canvas. The public output
+ * canvas remains a 2D canvas for preview and CanvasSource compatibility; only
+ * one GPU-to-canvas draw is performed after all tiles are composited.
+ */
+export class GPUFrameRenderer {
+  private readonly device: GPUDevice;
+  private readonly session: ort.InferenceSession;
+  private readonly scale: number;
+  private readonly context: WebGPUContext;
+  private gpuCanvas: OffscreenCanvas | null = null;
+  private gpuCanvasContext: GPUCanvasContext | null = null;
+  private inputTexture: GPUTexture | null = null;
+  private inputBuffer: GPUBuffer | null = null;
+  private outputTexture: GPUTexture | null = null;
+  private preprocessParams: GPUBuffer | null = null;
+  private postprocessParams: GPUBuffer | null = null;
+  private tileInputWidth = 0;
+  private tileInputHeight = 0;
+  private tileOutputWidth = 0;
+  private tileOutputHeight = 0;
+  private outputWidth = 0;
+  private outputHeight = 0;
+  private targetTexture: GPUTexture | null = null;
+  private lastTiming: GPUFrameTiming = {
+    preprocessMs: 0,
+    inferenceMs: 0,
+    postprocessMs: 0,
+    canvasMs: 0,
+  };
+
+  private constructor(
+    device: GPUDevice,
+    session: ort.InferenceSession,
+    scale: number,
+    context: WebGPUContext
+  ) {
+    this.device = device;
+    this.session = session;
+    this.scale = scale;
+    this.context = context;
+  }
+
+  static async create(
+    session: ort.InferenceSession,
+    scale: number
+  ): Promise<GPUFrameRenderer | null> {
+    try {
+      const device = await (ort.env as any).webgpu?.device as GPUDevice | undefined;
+      if (!device) return null;
+      const context = await initWebGPUContext(device);
+      return new GPUFrameRenderer(device, session, scale, context);
+    } catch (error) {
+      console.warn('GPU frame renderer unavailable:', error);
+      return null;
+    }
+  }
+
+  private ensureResources(
+    outputWidth: number,
+    outputHeight: number,
+    tileInputWidth: number,
+    tileInputHeight: number
+  ): void {
+    const tileOutputWidth = tileInputWidth * this.scale;
+    const tileOutputHeight = tileInputHeight * this.scale;
+    const dimensionsChanged =
+      this.outputWidth !== outputWidth ||
+      this.outputHeight !== outputHeight ||
+      this.tileInputWidth !== tileInputWidth ||
+      this.tileInputHeight !== tileInputHeight;
+
+    if (!dimensionsChanged) return;
+
+    this.destroyTileResources();
+
+    this.outputWidth = outputWidth;
+    this.outputHeight = outputHeight;
+    this.tileInputWidth = tileInputWidth;
+    this.tileInputHeight = tileInputHeight;
+    this.tileOutputWidth = tileOutputWidth;
+    this.tileOutputHeight = tileOutputHeight;
+
+    this.gpuCanvas = new OffscreenCanvas(outputWidth, outputHeight);
+    // OffscreenCanvas.getContext() is typed as a union of all rendering
+    // contexts; the requested context string narrows this at runtime.
+    this.gpuCanvasContext = this.gpuCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
+    if (!this.gpuCanvasContext) {
+      throw new Error('Unable to create WebGPU output canvas');
+    }
+    this.gpuCanvasContext.configure({
+      device: this.device,
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT |
+        GPUTextureUsage.COPY_SRC |
+        GPUTextureUsage.COPY_DST,
+      alphaMode: 'premultiplied',
+    });
+
+    this.inputTexture = this.device.createTexture({
+      size: [tileInputWidth, tileInputHeight],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.inputBuffer = this.device.createBuffer({
+      size: alignTo16(3 * tileInputWidth * tileInputHeight * 4),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.outputTexture = this.device.createTexture({
+      size: [tileOutputWidth, tileOutputHeight],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+    this.preprocessParams = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.postprocessParams = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      this.preprocessParams,
+      0,
+      new Uint32Array([tileInputWidth, tileInputHeight])
+    );
+    this.device.queue.writeBuffer(
+      this.postprocessParams,
+      0,
+      new Uint32Array([tileOutputWidth, tileOutputHeight])
+    );
+  }
+
+  async render(
+    source: ImageBitmap | VideoFrame | OffscreenCanvas,
+    outputCanvas: OffscreenCanvas,
+    outputWidth: number,
+    outputHeight: number,
+    tiles: readonly GPUFrameTile[]
+  ): Promise<void> {
+    if (tiles.length === 0) return;
+    const now = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const timing: GPUFrameTiming = {
+      preprocessMs: 0,
+      inferenceMs: 0,
+      postprocessMs: 0,
+      canvasMs: 0,
+    };
+    const firstTile = tiles[0];
+    this.ensureResources(
+      outputWidth,
+      outputHeight,
+      firstTile.inputWidth,
+      firstTile.inputHeight
+    );
+
+    if (!this.gpuCanvasContext || !this.inputTexture || !this.inputBuffer ||
+        !this.outputTexture || !this.preprocessParams || !this.postprocessParams) {
+      throw new Error('GPU frame renderer resources are unavailable');
+    }
+
+    this.targetTexture = this.gpuCanvasContext.getCurrentTexture();
+    const inputName = this.session.inputNames[0];
+    const outputName = this.session.outputNames[0];
+
+    for (const tile of tiles) {
+      if (tile.inputWidth !== this.tileInputWidth || tile.inputHeight !== this.tileInputHeight) {
+        throw new Error('GPU frame renderer requires one tile shape per frame');
+      }
+
+      const preprocessStarted = now();
+      this.device.queue.copyExternalImageToTexture(
+        {
+          source,
+          origin: { x: tile.sourceX, y: tile.sourceY },
+        },
+        { texture: this.inputTexture },
+        [tile.inputWidth, tile.inputHeight]
+      );
+
+      const preprocessBindGroup = this.device.createBindGroup({
+        layout: this.context.bindGroupLayouts.preprocess,
+        entries: [
+          { binding: 0, resource: this.inputTexture.createView() },
+          { binding: 1, resource: { buffer: this.inputBuffer } },
+          { binding: 2, resource: { buffer: this.preprocessParams } },
+        ],
+      });
+
+      const encoder = this.device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.context.pipelines.preprocessF32);
+      pass.setBindGroup(0, preprocessBindGroup);
+      pass.dispatchWorkgroups(
+        Math.ceil(tile.inputWidth / 16),
+        Math.ceil(tile.inputHeight / 16)
+      );
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+      timing.preprocessMs += now() - preprocessStarted;
+
+      const inputTensor = ort.Tensor.fromGpuBuffer(this.inputBuffer, {
+        dataType: 'float32',
+        dims: [1, 3, tile.inputHeight, tile.inputWidth],
+      });
+      const inferenceStarted = now();
+      const outputs = await this.session.run({ [inputName]: inputTensor });
+      timing.inferenceMs += now() - inferenceStarted;
+      const output = outputs[outputName];
+
+      try {
+        if (!output || output.location !== 'gpu-buffer') {
+          throw new Error('ONNX Runtime returned a CPU output for GPU rendering');
+        }
+        const outputWidth = Number(output.dims[3]);
+        const outputHeight = Number(output.dims[2]);
+        if (outputWidth !== this.tileOutputWidth || outputHeight !== this.tileOutputHeight) {
+          throw new Error('ONNX output shape does not match GPU tile resources');
+        }
+
+        const postprocessStarted = now();
+        const postprocessBindGroup = this.device.createBindGroup({
+          layout: this.context.bindGroupLayouts.postprocess,
+          entries: [
+            { binding: 0, resource: { buffer: output.gpuBuffer } },
+            { binding: 1, resource: this.outputTexture.createView() },
+            { binding: 2, resource: { buffer: this.postprocessParams } },
+          ],
+        });
+        const postprocessEncoder = this.device.createCommandEncoder();
+        const postprocessPass = postprocessEncoder.beginComputePass();
+        postprocessPass.setPipeline(this.context.pipelines.postprocessF32);
+        postprocessPass.setBindGroup(0, postprocessBindGroup);
+        postprocessPass.dispatchWorkgroups(
+          Math.ceil(this.tileOutputWidth / 16),
+          Math.ceil(this.tileOutputHeight / 16)
+        );
+        postprocessPass.end();
+        postprocessEncoder.copyTextureToTexture(
+          {
+            texture: this.outputTexture,
+            origin: { x: tile.keepStartX, y: tile.keepStartY },
+          },
+          {
+            texture: this.targetTexture,
+            origin: { x: tile.destinationX, y: tile.destinationY },
+          },
+          [tile.keepWidth, tile.keepHeight]
+        );
+        this.device.queue.submit([postprocessEncoder.finish()]);
+        await this.device.queue.onSubmittedWorkDone();
+        timing.postprocessMs += now() - postprocessStarted;
+      } finally {
+        output?.dispose();
+        inputTensor.dispose();
+      }
+    }
+
+    await this.device.queue.onSubmittedWorkDone();
+    const canvasStarted = now();
+    const outputContext = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+    if (!outputContext || !this.gpuCanvas) {
+      throw new Error('Unable to mirror GPU output to the public canvas');
+    }
+    outputContext.drawImage(this.gpuCanvas, 0, 0, outputWidth, outputHeight);
+    timing.canvasMs = now() - canvasStarted;
+    this.lastTiming = timing;
+  }
+
+  getLastTiming(): GPUFrameTiming {
+    return { ...this.lastTiming };
+  }
+
+  dispose(): void {
+    this.destroyTileResources();
+    this.gpuCanvas = null;
+    this.gpuCanvasContext = null;
+  }
+
+  private destroyTileResources(): void {
+    this.inputTexture?.destroy();
+    this.inputBuffer?.destroy();
+    this.outputTexture?.destroy();
+    this.preprocessParams?.destroy();
+    this.postprocessParams?.destroy();
+    this.inputTexture = null;
+    this.inputBuffer = null;
+    this.outputTexture = null;
+    this.preprocessParams = null;
+    this.postprocessParams = null;
+  }
+}
+
 /**
  * Get the WebGPU device from ONNX Runtime.
  * Must be called AFTER at least one inference has run.
