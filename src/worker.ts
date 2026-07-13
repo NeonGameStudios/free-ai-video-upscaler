@@ -10,6 +10,7 @@ import {
   BufferTarget,
   CanvasSource,
   Input,
+  MATROSKA,
   MP4,
   Mp4OutputFormat,
   Output,
@@ -17,6 +18,7 @@ import {
   StreamTarget,
   VideoSample,
   VideoSampleSink,
+  WEBM,
   WebMOutputFormat,
   AudioSampleSink,
   AudioSampleSource,
@@ -459,7 +461,10 @@ async function initRecording(
     const source = new BlobSource(file);
 
     input = new Input({
-      formats: [MP4],
+      // Prefer the native demuxers for MP4, Matroska, and WebM. The main
+      // thread probes MKV support and only invokes FFmpeg when the browser's
+      // WebCodecs path cannot decode it.
+      formats: [MP4, MATROSKA, WEBM],
       source
     });
 

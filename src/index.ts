@@ -27,7 +27,6 @@ import type {
   ModelConfig,
 } from './types/worker-messages';
 import { isModelAvailable } from './model-loader';
-import { needsRemux, remuxToMp4, getBaseName } from './remux';
 
 // Extended model info with availability status for UI
 interface ModelInfoWithAvailability extends ModelInfo {
@@ -76,6 +75,81 @@ const MAX_CLEANUP_PREVIEW_HEIGHT = 144;
 let download_name: string;
 let inputFileHandle: FileSystemFileHandle | null = null;
 let inputFile: File | null = null;  // Used for remuxed MKV files
+
+function isMatroskaFilename(filename: string): boolean {
+    const ext = filename.toLowerCase().split('.').pop();
+    return ext === 'mkv' || ext === 'matroska';
+}
+
+function getBaseName(filename: string): string {
+    return filename.replace(/\.[^/.]+$/, '');
+}
+
+/**
+ * Probe the native MediaBunny/WebCodecs path before downloading FFmpeg. This
+ * only reads container metadata and asks the browser whether the primary
+ * video track is decodable; the original file remains available for the
+ * worker when the probe succeeds.
+ */
+async function canDecodeNativeContainer(file: File): Promise<boolean> {
+    try {
+        const { BlobSource, Input, MATROSKA, WEBM } = await import('mediabunny');
+        const input = new Input({
+            formats: [MATROSKA, WEBM],
+            source: new BlobSource(file),
+        });
+
+        try {
+            const track = await input.getPrimaryVideoTrack();
+            return !!track && await track.canDecode();
+        } finally {
+            input.dispose();
+        }
+    } catch (error) {
+        console.debug('Native Matroska/WebM probe failed; using FFmpeg fallback:', error);
+        return false;
+    }
+}
+
+/**
+ * HTMLVideoElement is still used for the preview UI. A native WebCodecs
+ * decoder can support a container that the element cannot render, so verify a
+ * decoded frame as well before committing to the native input handle.
+ */
+async function canPreviewVideo(data: Blob): Promise<boolean> {
+    const candidate = document.createElement('video');
+    const objectUrl = URL.createObjectURL(data);
+
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value: boolean) => {
+            if (settled) return;
+            settled = true;
+            candidate.onloadeddata = null;
+            candidate.onerror = null;
+            candidate.removeAttribute('src');
+            candidate.load();
+            URL.revokeObjectURL(objectUrl);
+            resolve(value);
+        };
+
+        const timeout = setTimeout(() => finish(false), 5000);
+        candidate.muted = true;
+        // We wait for loadeddata (not just metadata) so a container that has
+        // readable headers but an unsupported codec is sent through FFmpeg.
+        candidate.preload = 'auto';
+        candidate.onloadeddata = () => {
+            clearTimeout(timeout);
+            finish(true);
+        };
+        candidate.onerror = () => {
+            clearTimeout(timeout);
+            finish(false);
+        };
+        candidate.src = objectUrl;
+        candidate.load();
+    });
+}
 
 // Declare global window functions for Alpine to call and File System Access API
 declare global {
@@ -427,7 +501,8 @@ function replacePreviewCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
 
 /**
  * Load video file from FileSystemFileHandle.
- * Automatically remuxes MKV files to MP4 for browser compatibility.
+ * Uses native Matroska/WebM support when available and lazily falls back to
+ * FFmpeg remuxing only when the browser cannot decode the container.
  */
 async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     Alpine.store('state', 'loading');
@@ -441,26 +516,39 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
     // Set up initial filename (use base name, will add extension based on output format)
     Alpine.store('filename', originalFilename);
 
-    // Check if file needs remuxing (MKV -> MP4)
-    if (needsRemux(originalFilename)) {
-        Alpine.store('loading_message', 'Converting MKV to MP4...');
+    if (isMatroskaFilename(originalFilename)) {
+        const nativeContainer = await canDecodeNativeContainer(file);
+        const nativePreview = nativeContainer && await canPreviewVideo(file);
 
-        try {
-            const arrayBuffer = await remuxToMp4(file, (message) => {
-                Alpine.store('loading_message', message);
-            });
+        if (nativePreview) {
+            Alpine.store('loading_message', 'Loading native Matroska input...');
+            // Keep the original handle so the worker can stream the source
+            // without creating an intermediate MP4 or duplicating the file.
+            inputFileHandle = fileHandle;
+            inputFile = null;
+        } else {
+            Alpine.store('loading_message', 'Converting MKV to MP4...');
 
-            // Store remuxed file directly (can't use virtual FileSystemFileHandle with postMessage)
-            const mp4Blob = new Blob([arrayBuffer], { type: 'video/mp4' });
-            inputFile = new File([mp4Blob], getBaseName(originalFilename) + '.mp4', { type: 'video/mp4' });
-            inputFileHandle = null;  // No handle for remuxed files
-        } catch (e) {
-            console.error('Remux failed:', e);
-            showError(`Failed to convert MKV: ${e}`);
-            return;
+            try {
+                // Keep FFmpeg and its large loader out of the initial bundle.
+                const { remuxToMp4 } = await import('./remux');
+                const arrayBuffer = await remuxToMp4(file, (message) => {
+                    Alpine.store('loading_message', message);
+                });
+
+                // Store remuxed file directly (can't use virtual FileSystemFileHandle with postMessage)
+                const mp4Blob = new Blob([arrayBuffer], { type: 'video/mp4' });
+                inputFile = new File([mp4Blob], getBaseName(originalFilename) + '.mp4', { type: 'video/mp4' });
+                inputFileHandle = null;  // No handle for remuxed files
+            } catch (e) {
+                console.error('Remux failed:', e);
+                showError(`Failed to convert MKV: ${e}`);
+                return;
+            }
         }
     } else {
-        // Store the original file handle for processing
+        // MP4 and WebM inputs can stream directly to the worker. The worker's
+        // format list includes both ISO-BMFF and Matroska/WebM demuxers.
         inputFileHandle = fileHandle;
         inputFile = null;
     }

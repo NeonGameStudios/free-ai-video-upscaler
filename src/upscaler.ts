@@ -125,6 +125,8 @@ export class Upscaler {
   private preprocessCtx: OffscreenCanvasRenderingContext2D | null = null;
   private inputFloat32: Float32Array | null = null;
   private inputFloat16: Uint16Array | null = null;
+  private videoFramePixels: Uint8Array | null = null;
+  private videoFrameCopySupported: boolean | null = null;
   private outputImageData: ImageData | null = null;
   private lastTiming: UpscaleTiming | null = null;
   private gpuRenderer: GPUFrameRenderer | null = null;
@@ -260,13 +262,7 @@ export class Upscaler {
     // The GPU bridge currently supports dynamic float32 models only. Models
     // with fixed or padded input shapes stay on the verified CPU path until
     // their shader padding and compositing paths are validated.
-    if (
-      this.executionProvider === 'webgpu' &&
-      !this.useFloat16 &&
-      !this.config.inputWidth &&
-      !this.config.inputHeight &&
-      (this.config.inputMultiple || 1) <= 1
-    ) {
+    if (this.executionProvider === 'webgpu' && this.supportsGpuFrameRenderer()) {
       this.gpuRenderer = await GPUFrameRenderer.create(this.session, this.config.scale);
     }
 
@@ -290,7 +286,13 @@ export class Upscaler {
     };
 
     if (provider === 'webgpu') {
-      sessionOptions.preferredOutputLocation = 'gpu-buffer';
+      // Only the dynamic float32 bridge consumes GPU-resident outputs directly.
+      // Fixed-shape, padded, and float16 models use the CPU postprocess path;
+      // asking ORT for gpu-buffer outputs there would force a GPU->CPU readback
+      // for every tile in getTensorData().
+      sessionOptions.preferredOutputLocation = this.supportsGpuFrameRenderer()
+        ? 'gpu-buffer'
+        : 'cpu';
     }
 
     if (loadedModel.externalData?.length) {
@@ -467,6 +469,23 @@ export class Upscaler {
       throw new Error(`Source tile ${width}x${height} exceeds model input ${tensorWidth}x${tensorHeight}`);
     }
 
+    const videoFrame = this.getVideoFrame(source);
+    if (videoFrame && this.videoFrameCopySupported !== false) {
+      const copied = await this.preprocessVideoFrame(
+        videoFrame,
+        sx,
+        sy,
+        width,
+        height,
+        tensorWidth,
+        tensorHeight,
+      );
+
+      if (copied) {
+        return copied;
+      }
+    }
+
     // Reuse canvas if same size, otherwise create new one
     if (!this.preprocessCanvas || this.preprocessCanvas.width !== tensorWidth || this.preprocessCanvas.height !== tensorHeight) {
       this.preprocessCanvas = new OffscreenCanvas(tensorWidth, tensorHeight);
@@ -519,6 +538,151 @@ export class Upscaler {
       width,
       height
     };
+  }
+
+  private getVideoFrame(source: UpscaleSource): VideoFrame | null {
+    if (typeof VideoFrame === 'undefined' || !(source instanceof VideoFrame)) {
+      return null;
+    }
+
+    // copyTo() addresses the coded pixel rectangle, while the canvas path
+    // uses display coordinates. Keep the fast path for the common 1:1 case;
+    // rotated/cropped frames stay on the canvas fallback so coordinates and
+    // color conversion remain identical to the existing implementation.
+    const visible = source.visibleRect;
+    if (
+      source.displayWidth !== source.codedWidth ||
+      source.displayHeight !== source.codedHeight ||
+      ((source as VideoFrame & { rotation?: number }).rotation ?? 0) !== 0 ||
+      !!visible && (
+        visible.x !== 0 ||
+        visible.y !== 0 ||
+        visible.width !== source.codedWidth ||
+        visible.height !== source.codedHeight
+      )
+    ) {
+      return null;
+    }
+
+    return source;
+  }
+
+  /**
+   * Fast CPU/WASM preprocessing path for decoded VideoFrames. WebCodecs can
+   * convert the frame directly into packed RGBA bytes, avoiding a canvas draw
+   * and readback for every tile. Any unsupported format/browser falls back to
+   * the existing canvas path for correctness.
+   */
+  private async preprocessVideoFrame(
+    source: VideoFrame,
+    sx: number,
+    sy: number,
+    width: number,
+    height: number,
+    tensorWidth: number,
+    tensorHeight: number,
+  ): Promise<{ tensor: ort.Tensor; width: number; height: number } | null> {
+    try {
+      const rect = { x: sx, y: sy, width, height };
+      const requiredBytes = source.allocationSize({ format: 'RGBA', rect });
+
+      if (!this.videoFramePixels || this.videoFramePixels.byteLength < requiredBytes) {
+        this.videoFramePixels = new Uint8Array(requiredBytes);
+      }
+
+      const layout = await source.copyTo(this.videoFramePixels, { format: 'RGBA', rect });
+      const plane = layout[0];
+      if (!plane) {
+        throw new Error('VideoFrame.copyTo returned no RGBA plane');
+      }
+
+      this.videoFrameCopySupported = true;
+      return this.createTensorFromRgba(
+        this.videoFramePixels,
+        plane.offset,
+        plane.stride,
+        width,
+        height,
+        tensorWidth,
+        tensorHeight,
+      );
+    } catch (error) {
+      if (this.videoFrameCopySupported !== false) {
+        console.debug('VideoFrame.copyTo RGBA unavailable; using canvas preprocessing:', error);
+      }
+      this.videoFrameCopySupported = false;
+      return null;
+    }
+  }
+
+  private createTensorFromRgba(
+    pixels: Uint8Array,
+    offset: number,
+    stride: number,
+    width: number,
+    height: number,
+    tensorWidth: number,
+    tensorHeight: number,
+  ): { tensor: ort.Tensor; width: number; height: number } {
+    const planeSize = tensorHeight * tensorWidth;
+    const tensorLength = 3 * planeSize;
+
+    if (this.useFloat16) {
+      if (!this.inputFloat16 || this.inputFloat16.length !== tensorLength) {
+        this.inputFloat16 = new Uint16Array(tensorLength);
+      }
+
+      for (let y = 0; y < tensorHeight; y++) {
+        const sourceY = Math.min(y, height - 1);
+        const row = offset + sourceY * stride;
+        for (let x = 0; x < tensorWidth; x++) {
+          const sourceX = Math.min(x, width - 1);
+          const pixel = row + sourceX * 4;
+          const index = y * tensorWidth + x;
+          this.inputFloat16[index] = BYTE_TO_FLOAT16[pixels[pixel]];
+          this.inputFloat16[planeSize + index] = BYTE_TO_FLOAT16[pixels[pixel + 1]];
+          this.inputFloat16[2 * planeSize + index] = BYTE_TO_FLOAT16[pixels[pixel + 2]];
+        }
+      }
+
+      return {
+        tensor: new ort.Tensor('float16', this.inputFloat16, [1, 3, tensorHeight, tensorWidth]),
+        width,
+        height,
+      };
+    }
+
+    if (!this.inputFloat32 || this.inputFloat32.length !== tensorLength) {
+      this.inputFloat32 = new Float32Array(tensorLength);
+    }
+
+    for (let y = 0; y < tensorHeight; y++) {
+      const sourceY = Math.min(y, height - 1);
+      const row = offset + sourceY * stride;
+      for (let x = 0; x < tensorWidth; x++) {
+        const sourceX = Math.min(x, width - 1);
+        const pixel = row + sourceX * 4;
+        const index = y * tensorWidth + x;
+        this.inputFloat32[index] = BYTE_TO_FLOAT32[pixels[pixel]];
+        this.inputFloat32[planeSize + index] = BYTE_TO_FLOAT32[pixels[pixel + 1]];
+        this.inputFloat32[2 * planeSize + index] = BYTE_TO_FLOAT32[pixels[pixel + 2]];
+      }
+    }
+
+    return {
+      tensor: new ort.Tensor('float32', this.inputFloat32, [1, 3, tensorHeight, tensorWidth]),
+      width,
+      height,
+    };
+  }
+
+  private supportsGpuFrameRenderer(): boolean {
+    return (
+      !this.useFloat16 &&
+      !this.config.inputWidth &&
+      !this.config.inputHeight &&
+      (this.config.inputMultiple || 1) <= 1
+    );
   }
 
   private alignToInputMultiple(value: number): number {
@@ -895,6 +1059,8 @@ export class Upscaler {
     this.preprocessCtx = null;
     this.inputFloat32 = null;
     this.inputFloat16 = null;
+    this.videoFramePixels = null;
+    this.videoFrameCopySupported = null;
     this.outputImageData = null;
     this.lastTiming = null;
   }
