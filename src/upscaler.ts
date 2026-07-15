@@ -162,7 +162,14 @@ export class Upscaler {
   static async initORT(): Promise<boolean> {
     try {
       // Configure ONNX Runtime
-      ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+      // Leave one logical core for decode/encode and cap the pool so a high
+      // core-count Mac does not spend more time scheduling WASM workers than
+      // doing inference. WebGPU sessions are unaffected by this setting.
+      const hardwareThreads = navigator.hardwareConcurrency || 4;
+      ort.env.wasm.numThreads = Math.min(
+        Math.max(hardwareThreads - 1, 1),
+        8
+      );
       ort.env.wasm.simd = true;
 
       // Set WASM paths for webpack bundling
