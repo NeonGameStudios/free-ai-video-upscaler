@@ -78,8 +78,8 @@ The dev server runs at `http://localhost:8080`. Open in Chrome/Safari to use Web
 
 The renderer uses an adaptive, overlap-aware tile plan so edge tiles do not
 repeat a full maximum-size inference. It also reports averaged decode,
-preprocess, inference, postprocess, canvas, and encode timings in the worker's
-diagnostic `timing` message.
+preprocess, inference, postprocess, GPU queue-wait, GPU timestamp, canvas, and
+encode timings in the worker's diagnostic `timing` message.
 
 ```bash
 # Check the adaptive tile plan against representative frame sizes
@@ -108,6 +108,9 @@ bound a run, for example:
 
 For tiled-path experiments, add `tileSize=256` (the default is 512 for 4x
 models); the selected tile size is reported with each case.
+
+Set `gpuTiming=1` (the default for the encoding benchmark) to include hardware
+timestamp-query measurements when the browser exposes the WebGPU feature.
 
 The encoding benchmark intentionally writes video-only MP4 output so audio
 passthrough does not obscure decode, upscale, and video-encoder comparisons.

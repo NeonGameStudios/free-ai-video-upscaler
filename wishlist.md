@@ -115,6 +115,10 @@ but remain explicitly experimental: WebGPU validation failures use the
 original model through WASM. `verify:onnx-rewrite` covers every local
 AnimeJaNai model.
 
+The GPU compositor now configures its presentation surface with the browser's
+preferred WebGPU swapchain format and an opaque alpha mode. This matches the
+Metal-native path on macOS without changing the RGBA tile-processing format.
+
 ## Remaining
 
 ### 1. RVRT / VRT Temporal Video Restoration

@@ -17,6 +17,7 @@ import compositeShader from './shaders/composite.wgsl';
 
 export interface WebGPUContext {
   device: GPUDevice;
+  canvasFormat: GPUTextureFormat;
   pipelines: {
     preprocessF32: GPUComputePipeline;
     postprocessF32: GPUComputePipeline;
@@ -184,12 +185,14 @@ export class GPUFrameRenderer {
     }
     this.gpuCanvasContext.configure({
       device: this.device,
-      format: 'rgba8unorm',
+      format: this.context.canvasFormat,
       // The canvas swapchain is only used as a render attachment. Tile
       // compositing happens in a regular texture below; copying directly into
       // a swapchain texture is rejected by Chromium on some Metal drivers.
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
-      alphaMode: 'premultiplied',
+      // The compositor always writes opaque pixels; avoid premultiplied-alpha
+      // conversion on the Mac swapchain.
+      alphaMode: 'opaque',
     });
 
     this.inputTexture = this.device.createTexture({
@@ -590,6 +593,12 @@ export function getORTWebGPUDevice(): GPUDevice | null {
  * Initialize WebGPU compute pipelines for pre/post processing.
  */
 export async function initWebGPUContext(device: GPUDevice): Promise<WebGPUContext> {
+  // Metal commonly prefers BGRA; using the browser's native swapchain format
+  // avoids an implicit format conversion in the final presentation pass.
+  const canvasFormat = typeof navigator !== 'undefined' &&
+    typeof navigator.gpu?.getPreferredCanvasFormat === 'function'
+    ? navigator.gpu.getPreferredCanvasFormat()
+    : 'rgba8unorm';
   // Create bind group layouts
   const preprocessLayout = device.createBindGroupLayout({
     entries: [
@@ -668,13 +677,14 @@ export async function initWebGPUContext(device: GPUDevice): Promise<WebGPUContex
     fragment: {
       module: device.createShaderModule({ code: compositeShader }),
       entryPoint: 'fragment',
-      targets: [{ format: 'rgba8unorm' }],
+      targets: [{ format: canvasFormat }],
     },
     primitive: { topology: 'triangle-list' },
   });
 
   return {
     device,
+    canvasFormat,
     pipelines: {
       preprocessF32,
       postprocessF32,
