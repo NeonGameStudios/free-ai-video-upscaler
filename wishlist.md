@@ -101,6 +101,15 @@ outputs, WGSL postprocessing, and GPU tile compositing. The public 2D canvas
 is updated once per frame for preview and encoding compatibility. A failed
 interop step disposes the bridge and falls back to the CPU-tiled renderer.
 
+The compositor now copies tile results into a regular GPU texture and presents
+that texture with one render pass. This avoids copying directly into the
+canvas swapchain, which triggered Chromium/Metal validation errors and added
+avoidable synchronization on the measured 720p/1080p paths.
+
+The final presentation pass is submitted with the last tile, and tiled frames
+retain up to four GPU outputs before fencing. This removes a redundant queue
+submit per frame while keeping tensor disposal behind the GPU completion fence.
+
 AnimeJaNai float16 graphs now attempt WebGPU after a PRelu-to-primitive rewrite,
 but remain explicitly experimental: WebGPU validation failures use the
 original model through WASM. `verify:onnx-rewrite` covers every local
@@ -114,17 +123,19 @@ Investigate RVRT or VRT for temporal cleanup across multiple frames. This is def
 
 ### 2. Full End-To-End Clip Encoding Benchmark
 
-The browser regression harness now decodes and upscales a bounded number of
-frames from `test-clips/BotsMaster-15sec.mp4`, records provider/tile/timing
-data, and rejects an empty pixel checksum. A longer full-output benchmark is
-still useful for recording:
+`benchmark:encoding` now uses both repository clips as fixed inputs and runs
+480p, 720p, and 1080p target-height cases. It records:
 
 - model selected
 - input and output resolution
 - per-frame render time
 - total encode time
 - output file size
-- visual sanity checks for snow/corruption across the complete encoded output
+- a deterministic pixel checksum for visual sanity checks
+
+The default run can be bounded with `clip`, `targets`, and `frames` query
+parameters while comparing experimental branches. Full-duration runs remain
+useful for final validation of snow/corruption across the complete output.
 
 ### 3. Model/Content Recommendations
 

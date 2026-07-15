@@ -11,7 +11,8 @@
     "benchmark:tiling": "node scripts/benchmark-tiling.cjs",
     "verify:onnx-rewrite": "node scripts/verify-onnx-rewrite.cjs",
     "benchmark:webgpu": "webpack --config scripts/gpu-benchmark.webpack.cjs --mode development",
-    "benchmark:clip": "webpack --config scripts/clip-regression.webpack.cjs --mode development"
+    "benchmark:clip": "webpack --config scripts/clip-regression.webpack.cjs --mode development",
+    "benchmark:encoding": "webpack --config scripts/encoding-benchmark.webpack.cjs --mode development"
   },
   "repository": {
     "type": "git",

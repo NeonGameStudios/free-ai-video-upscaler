@@ -93,10 +93,26 @@ npm run benchmark:webgpu
 
 # Decode and upscale six frames from test-clips/BotsMaster-15sec.mp4
 npm run benchmark:clip
+
+# Build the repeatable two-clip encoding benchmark
+npm run benchmark:encoding
 ```
 
-The two browser benchmarks emit `gpu-benchmark.js` and `clip-regression.js`;
-load their corresponding temporary HTML pages from the development server.
+The browser benchmarks emit `gpu-benchmark.js`, `clip-regression.js`, and a
+content-hashed `encoding-benchmark.*.js`; load their corresponding temporary HTML pages from
+the development server. The encoding benchmark uses both repository clips and
+tests 480p, 720p, and 1080p target heights by default. Use query parameters to
+bound a run, for example:
+
+`encoding-benchmark.html?clip=short&targets=720,1080&frames=30`
+
+For tiled-path experiments, add `tileSize=256` (the default is 512 for 4x
+models); the selected tile size is reported with each case.
+
+The encoding benchmark intentionally writes video-only MP4 output so audio
+passthrough does not obscure decode, upscale, and video-encoder comparisons.
+For reproducible local runs, the temporary benchmark bundle embeds the two
+repository clips; the production bundle does not include them.
 
 AnimeJaNai float16 WebGPU is deliberately experimental: the graph rewrite is
 validated structurally, but browsers/ONNX Runtime builds that cannot execute

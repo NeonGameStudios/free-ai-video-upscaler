@@ -13,6 +13,7 @@ import preprocessShaderF32 from './shaders/preprocess.wgsl';
 import postprocessShaderF32 from './shaders/postprocess.wgsl';
 import preprocessShaderF16 from './shaders/preprocess-f16.wgsl';
 import postprocessShaderF16 from './shaders/postprocess-f16.wgsl';
+import compositeShader from './shaders/composite.wgsl';
 
 export interface WebGPUContext {
   device: GPUDevice;
@@ -21,10 +22,12 @@ export interface WebGPUContext {
     postprocessF32: GPUComputePipeline;
     preprocessF16: GPUComputePipeline;
     postprocessF16: GPUComputePipeline;
+    composite: GPURenderPipeline;
   };
   bindGroupLayouts: {
     preprocess: GPUBindGroupLayout;
     postprocess: GPUBindGroupLayout;
+    composite: GPUBindGroupLayout;
   };
 }
 
@@ -67,6 +70,8 @@ export interface GPUFrameTiming {
   preprocessMs: number;
   inferenceMs: number;
   postprocessMs: number;
+  gpuWaitMs: number;
+  gpuTimestampMs: number;
   canvasMs: number;
 }
 
@@ -82,27 +87,35 @@ export class GPUFrameRenderer {
   private readonly session: ort.InferenceSession;
   private readonly scale: number;
   private readonly context: WebGPUContext;
+  private readonly gpuTimestampsEnabled: boolean;
   private gpuCanvas: OffscreenCanvas | null = null;
   private gpuCanvasContext: GPUCanvasContext | null = null;
   private inputTexture: GPUTexture | null = null;
   private inputBuffer: GPUBuffer | null = null;
   private outputTexture: GPUTexture | null = null;
+  private compositeTexture: GPUTexture | null = null;
   private inputTextureView: GPUTextureView | null = null;
   private outputTextureView: GPUTextureView | null = null;
+  private compositeTextureView: GPUTextureView | null = null;
   private preprocessBindGroup: GPUBindGroup | null = null;
+  private compositeBindGroup: GPUBindGroup | null = null;
   private preprocessParams: GPUBuffer | null = null;
   private postprocessParams: GPUBuffer | null = null;
+  private timestampQuerySet: GPUQuerySet | null = null;
+  private timestampResolveBuffer: GPUBuffer | null = null;
+  private timestampReadbackBuffer: GPUBuffer | null = null;
   private tileInputWidth = 0;
   private tileInputHeight = 0;
   private tileOutputWidth = 0;
   private tileOutputHeight = 0;
   private outputWidth = 0;
   private outputHeight = 0;
-  private targetTexture: GPUTexture | null = null;
   private lastTiming: GPUFrameTiming = {
     preprocessMs: 0,
     inferenceMs: 0,
     postprocessMs: 0,
+    gpuWaitMs: 0,
+    gpuTimestampMs: 0,
     canvasMs: 0,
   };
 
@@ -110,23 +123,27 @@ export class GPUFrameRenderer {
     device: GPUDevice,
     session: ort.InferenceSession,
     scale: number,
-    context: WebGPUContext
+    context: WebGPUContext,
+    gpuTimestampsEnabled: boolean
   ) {
     this.device = device;
     this.session = session;
     this.scale = scale;
     this.context = context;
+    this.gpuTimestampsEnabled = gpuTimestampsEnabled;
+    this.initializeTimestampQueries();
   }
 
   static async create(
     session: ort.InferenceSession,
-    scale: number
+    scale: number,
+    gpuTimestampsEnabled = false
   ): Promise<GPUFrameRenderer | null> {
     try {
       const device = await (ort.env as any).webgpu?.device as GPUDevice | undefined;
       if (!device) return null;
       const context = await initWebGPUContext(device);
-      return new GPUFrameRenderer(device, session, scale, context);
+      return new GPUFrameRenderer(device, session, scale, context, gpuTimestampsEnabled);
     } catch (error) {
       console.warn('GPU frame renderer unavailable:', error);
       return null;
@@ -168,16 +185,19 @@ export class GPUFrameRenderer {
     this.gpuCanvasContext.configure({
       device: this.device,
       format: 'rgba8unorm',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT |
-        GPUTextureUsage.COPY_SRC |
-        GPUTextureUsage.COPY_DST,
+      // The canvas swapchain is only used as a render attachment. Tile
+      // compositing happens in a regular texture below; copying directly into
+      // a swapchain texture is rejected by Chromium on some Metal drivers.
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
       alphaMode: 'premultiplied',
     });
 
     this.inputTexture = this.device.createTexture({
       size: [tileInputWidth, tileInputHeight],
       format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      usage: GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.inputBuffer = this.device.createBuffer({
       size: alignTo16(3 * tileInputWidth * tileInputHeight * 4),
@@ -187,6 +207,15 @@ export class GPUFrameRenderer {
       size: [tileOutputWidth, tileOutputHeight],
       format: 'rgba8unorm',
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+    this.compositeTexture = this.device.createTexture({
+      size: [outputWidth, outputHeight],
+      format: 'rgba8unorm',
+      // Chromium's Metal backend validates the destination as a renderable
+      // texture when it is later sampled by the presentation pass.
+      usage: GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.preprocessParams = this.device.createBuffer({
       size: 16,
@@ -211,6 +240,7 @@ export class GPUFrameRenderer {
     // Reusing them avoids rebuilding WebGPU object graphs for every tile.
     this.inputTextureView = this.inputTexture.createView();
     this.outputTextureView = this.outputTexture.createView();
+    this.compositeTextureView = this.compositeTexture.createView();
     this.preprocessBindGroup = this.device.createBindGroup({
       layout: this.context.bindGroupLayouts.preprocess,
       entries: [
@@ -219,6 +249,57 @@ export class GPUFrameRenderer {
         { binding: 2, resource: { buffer: this.preprocessParams } },
       ],
     });
+    this.compositeBindGroup = this.device.createBindGroup({
+      layout: this.context.bindGroupLayouts.composite,
+      entries: [{ binding: 0, resource: this.compositeTextureView }],
+    });
+  }
+
+  private initializeTimestampQueries(): void {
+    if (!this.gpuTimestampsEnabled || !this.device.features.has('timestamp-query')) {
+      return;
+    }
+
+    try {
+      this.timestampQuerySet = this.device.createQuerySet({ type: 'timestamp', count: 4 });
+      this.timestampResolveBuffer = this.device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      });
+      this.timestampReadbackBuffer = this.device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+    } catch (error) {
+      console.debug('GPU timestamp queries unavailable:', error);
+      this.timestampQuerySet?.destroy();
+      this.timestampResolveBuffer?.destroy();
+      this.timestampReadbackBuffer?.destroy();
+      this.timestampQuerySet = null;
+      this.timestampResolveBuffer = null;
+      this.timestampReadbackBuffer = null;
+    }
+  }
+
+  private async readTimestampMs(): Promise<number> {
+    if (!this.timestampReadbackBuffer) return 0;
+
+    try {
+      await this.timestampReadbackBuffer.mapAsync(GPUMapMode.READ);
+      const values = new BigUint64Array(this.timestampReadbackBuffer.getMappedRange());
+      const postprocessNs = values[1] - values[0];
+      const presentNs = values[3] - values[2];
+      this.timestampReadbackBuffer.unmap();
+      return Number(postprocessNs + presentNs) / 1_000_000;
+    } catch (error) {
+      console.debug('GPU timestamp readback unavailable:', error);
+      try {
+        this.timestampReadbackBuffer.unmap();
+      } catch {
+        // Ignore an already-unmapped buffer while falling back to fence timing.
+      }
+      return 0;
+    }
   }
 
   async render(
@@ -234,6 +315,8 @@ export class GPUFrameRenderer {
       preprocessMs: 0,
       inferenceMs: 0,
       postprocessMs: 0,
+      gpuWaitMs: 0,
+      gpuTimestampMs: 0,
       canvasMs: 0,
     };
     const firstTile = tiles[0];
@@ -245,19 +328,22 @@ export class GPUFrameRenderer {
     );
 
     if (!this.gpuCanvasContext || !this.inputTexture || !this.inputBuffer ||
-        !this.outputTexture || !this.preprocessParams || !this.postprocessParams) {
+        !this.outputTexture || !this.compositeTexture || !this.preprocessParams ||
+        !this.postprocessParams || !this.compositeBindGroup) {
       throw new Error('GPU frame renderer resources are unavailable');
     }
 
-    this.targetTexture = this.gpuCanvasContext.getCurrentTexture();
+    // Acquire the swapchain texture once. The final presentation pass is
+    // appended to the last tile submission below, so the compositor and
+    // presentation share one queue submit.
+    const presentTexture = this.gpuCanvasContext.getCurrentTexture();
     const inputName = this.session.inputNames[0];
     const outputName = this.session.outputNames[0];
 
     const pendingResources: Array<{ output: ort.Tensor; input: ort.Tensor }> = [];
-    // Two tiles retain at most two model outputs before a fence. This removes
-    // most per-tile synchronization without allowing large 4K tiles to grow
-    // unbounded GPU memory usage.
-    const maxPendingTiles = 2;
+    // Retain a small output window before fencing. Four tiles reduce queue
+    // synchronization for large frames while bounding GPU memory growth.
+    const maxPendingTiles = Math.min(Math.max(tiles.length, 1), 4);
 
     const flushPending = async (): Promise<void> => {
       if (pendingResources.length === 0) return;
@@ -266,7 +352,7 @@ export class GPUFrameRenderer {
       const fenceStarted = now();
       try {
         await this.device.queue.onSubmittedWorkDone();
-        timing.postprocessMs += now() - fenceStarted;
+        timing.gpuWaitMs += now() - fenceStarted;
       } finally {
         // ORT may recycle GPU output buffers after dispose(), so release them
         // only after postprocess and tile-copy commands have completed.
@@ -278,7 +364,8 @@ export class GPUFrameRenderer {
     };
 
     try {
-      for (const tile of tiles) {
+      for (let tileIndex = 0; tileIndex < tiles.length; tileIndex++) {
+        const tile = tiles[tileIndex];
         if (tile.inputWidth !== this.tileInputWidth || tile.inputHeight !== this.tileInputHeight) {
           throw new Error('GPU frame renderer requires one tile shape per frame');
         }
@@ -341,7 +428,17 @@ export class GPUFrameRenderer {
             ],
           });
           const postprocessEncoder = this.device.createCommandEncoder();
-          const postprocessPass = postprocessEncoder.beginComputePass();
+          const postprocessPass = postprocessEncoder.beginComputePass(
+            this.timestampQuerySet && tileIndex === 0
+              ? {
+                timestampWrites: {
+                  querySet: this.timestampQuerySet,
+                  beginningOfPassWriteIndex: 0,
+                  endOfPassWriteIndex: 1,
+                },
+              }
+              : undefined
+          );
           postprocessPass.setPipeline(this.context.pipelines.postprocessF32);
           postprocessPass.setBindGroup(0, postprocessBindGroup);
           postprocessPass.dispatchWorkgroups(
@@ -355,11 +452,53 @@ export class GPUFrameRenderer {
               origin: { x: tile.keepStartX, y: tile.keepStartY },
             },
             {
-              texture: this.targetTexture,
+              texture: this.compositeTexture,
               origin: { x: tile.destinationX, y: tile.destinationY },
             },
             [tile.keepWidth, tile.keepHeight]
           );
+
+          if (tileIndex === tiles.length - 1) {
+            const presentPass = postprocessEncoder.beginRenderPass({
+              colorAttachments: [{
+                view: presentTexture.createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              }],
+              ...(this.timestampQuerySet
+                ? {
+                  timestampWrites: {
+                    querySet: this.timestampQuerySet,
+                    beginningOfPassWriteIndex: 2,
+                    endOfPassWriteIndex: 3,
+                  },
+                }
+                : {}),
+            });
+            presentPass.setPipeline(this.context.pipelines.composite);
+            presentPass.setBindGroup(0, this.compositeBindGroup);
+            presentPass.draw(3);
+            presentPass.end();
+
+            if (this.timestampQuerySet && this.timestampResolveBuffer && this.timestampReadbackBuffer) {
+              postprocessEncoder.resolveQuerySet(
+                this.timestampQuerySet,
+                0,
+                4,
+                this.timestampResolveBuffer,
+                0
+              );
+              postprocessEncoder.copyBufferToBuffer(
+                this.timestampResolveBuffer,
+                0,
+                this.timestampReadbackBuffer,
+                0,
+                32
+              );
+            }
+          }
+
           this.device.queue.submit([postprocessEncoder.finish()]);
           timing.postprocessMs += now() - postprocessStarted;
           pendingResources.push({ output, input: inputTensor });
@@ -377,6 +516,7 @@ export class GPUFrameRenderer {
       }
 
       await flushPending();
+      timing.gpuTimestampMs = await this.readTimestampMs();
     } finally {
       // Ensure resources submitted before an exception are released too.
       await flushPending();
@@ -398,22 +538,36 @@ export class GPUFrameRenderer {
 
   dispose(): void {
     this.destroyTileResources();
+    this.destroyTimestampResources();
     this.gpuCanvas = null;
     this.gpuCanvasContext = null;
+  }
+
+  private destroyTimestampResources(): void {
+    this.timestampQuerySet?.destroy();
+    this.timestampResolveBuffer?.destroy();
+    this.timestampReadbackBuffer?.destroy();
+    this.timestampQuerySet = null;
+    this.timestampResolveBuffer = null;
+    this.timestampReadbackBuffer = null;
   }
 
   private destroyTileResources(): void {
     this.inputTexture?.destroy();
     this.inputBuffer?.destroy();
     this.outputTexture?.destroy();
+    this.compositeTexture?.destroy();
     this.preprocessParams?.destroy();
     this.postprocessParams?.destroy();
     this.inputTexture = null;
     this.inputBuffer = null;
     this.outputTexture = null;
+    this.compositeTexture = null;
     this.inputTextureView = null;
     this.outputTextureView = null;
+    this.compositeTextureView = null;
     this.preprocessBindGroup = null;
+    this.compositeBindGroup = null;
     this.preprocessParams = null;
     this.postprocessParams = null;
   }
@@ -453,6 +607,12 @@ export async function initWebGPUContext(device: GPUDevice): Promise<WebGPUContex
     ],
   });
 
+  const compositeLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+    ],
+  });
+
   // Create pipeline layouts
   const preprocessPipelineLayout = device.createPipelineLayout({
     bindGroupLayouts: [preprocessLayout],
@@ -460,6 +620,10 @@ export async function initWebGPUContext(device: GPUDevice): Promise<WebGPUContex
 
   const postprocessPipelineLayout = device.createPipelineLayout({
     bindGroupLayouts: [postprocessLayout],
+  });
+
+  const compositePipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [compositeLayout],
   });
 
   // Create compute pipelines
@@ -495,6 +659,20 @@ export async function initWebGPUContext(device: GPUDevice): Promise<WebGPUContex
     },
   });
 
+  const composite = device.createRenderPipeline({
+    layout: compositePipelineLayout,
+    vertex: {
+      module: device.createShaderModule({ code: compositeShader }),
+      entryPoint: 'vertex',
+    },
+    fragment: {
+      module: device.createShaderModule({ code: compositeShader }),
+      entryPoint: 'fragment',
+      targets: [{ format: 'rgba8unorm' }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
   return {
     device,
     pipelines: {
@@ -502,10 +680,12 @@ export async function initWebGPUContext(device: GPUDevice): Promise<WebGPUContex
       postprocessF32,
       preprocessF16,
       postprocessF16,
+      composite,
     },
     bindGroupLayouts: {
       preprocess: preprocessLayout,
       postprocess: postprocessLayout,
+      composite: compositeLayout,
     },
   };
 }

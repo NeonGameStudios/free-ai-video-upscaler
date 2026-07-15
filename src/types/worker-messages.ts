@@ -16,6 +16,8 @@ export interface FrameTiming {
   preprocessMs: number;
   inferenceMs: number;
   postprocessMs: number;
+  gpuWaitMs: number;
+  gpuTimestampMs: number;
   canvasMs: number;
   encodeMs: number;
   totalMs: number;

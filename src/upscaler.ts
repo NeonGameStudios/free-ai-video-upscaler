@@ -90,6 +90,7 @@ export interface UpscalerConfig {
   inputHeight?: number;
   inputMultiple?: number;
   denoiseLevel?: DenoiseLevel;
+  enableGpuTimestamps?: boolean;
 }
 
 export type UpscaleTiming = Omit<FrameTiming, 'decodeMs' | 'audioMs' | 'encodeMs' | 'totalMs' | 'frames'>;
@@ -104,6 +105,7 @@ const DEFAULT_CONFIG: UpscalerConfig = {
   inputHeight: undefined,
   inputMultiple: 1,
   denoiseLevel: 0,
+  enableGpuTimestamps: false,
 };
 
 /**
@@ -263,7 +265,11 @@ export class Upscaler {
     // with fixed or padded input shapes stay on the verified CPU path until
     // their shader padding and compositing paths are validated.
     if (this.executionProvider === 'webgpu' && this.supportsGpuFrameRenderer()) {
-      this.gpuRenderer = await GPUFrameRenderer.create(this.session, this.config.scale);
+      this.gpuRenderer = await GPUFrameRenderer.create(
+        this.session,
+        this.config.scale,
+        this.config.enableGpuTimestamps === true
+      );
     }
 
     this.initialized = true;
@@ -837,6 +843,8 @@ export class Upscaler {
       preprocessMs: 0,
       inferenceMs: 0,
       postprocessMs: 0,
+      gpuWaitMs: 0,
+      gpuTimestampMs: 0,
       canvasMs: 0,
       tileCount: 0,
       inputPixels: inputWidth * inputHeight,
@@ -907,6 +915,8 @@ export class Upscaler {
         timing.preprocessMs = gpuTiming.preprocessMs;
         timing.inferenceMs = gpuTiming.inferenceMs;
         timing.postprocessMs = gpuTiming.postprocessMs;
+        timing.gpuWaitMs = gpuTiming.gpuWaitMs;
+        timing.gpuTimestampMs = gpuTiming.gpuTimestampMs;
         timing.canvasMs = gpuTiming.canvasMs;
         timing.tileCount = gpuTiles.length;
         timing.inferredPixels = gpuTiles.reduce(
