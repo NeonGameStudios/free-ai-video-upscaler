@@ -124,6 +124,10 @@ default float32 models use the GPU-buffer path when ONNX Runtime returns a
 GPU-resident output; any interop failure falls back to the existing CPU-tiled
 renderer for correctness.
 
+WebGPU initialization requests the high-performance adapter on macOS so a
+machine with multiple adapters does not select a low-power device for model
+inference.
+
 ## Model Conversion
 
 To convert PyTorch models to ONNX format for browser inference:

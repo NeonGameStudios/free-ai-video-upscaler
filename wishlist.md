@@ -119,6 +119,10 @@ The GPU compositor now configures its presentation surface with the browser's
 preferred WebGPU swapchain format and an opaque alpha mode. This matches the
 Metal-native path on macOS without changing the RGBA tile-processing format.
 
+WebGPU initialization requests the high-performance adapter on macOS when the
+browser exposes more than one adapter, avoiding an accidental low-power GPU
+selection for inference.
+
 ## Remaining
 
 ### 1. RVRT / VRT Temporal Video Restoration
