@@ -171,6 +171,10 @@ export class Upscaler {
         8
       );
       ort.env.wasm.simd = true;
+      // Prefer the high-performance adapter for WebGPU. On macOS systems
+      // exposing multiple adapters this avoids accidentally selecting a
+      // low-power device for the main inference workload.
+      ort.env.webgpu.powerPreference = 'high-performance';
 
       // Set WASM paths for webpack bundling
       const basePath = self.location?.href?.replace(/\/[^\/]*$/, '/') || '/';
