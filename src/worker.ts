@@ -27,20 +27,27 @@ import {
   EncodedPacketSink,
   EncodedPacket,
   type AudioCodec,
+  type StreamTargetChunk,
   canEncodeVideo,
 } from 'mediabunny';
 
 import { Upscaler } from './upscaler';
+import {
+  resolveInferenceResolution,
+  resolveOutputResolution,
+} from './types/worker-messages';
 
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
   InitData,
   SwitchModelData,
+  RenderPreviewData,
   ProcessSettings,
   Resolution,
   OutputFormat,
   FrameTiming,
+  PipelineTelemetry,
 } from './types/worker-messages';
 
 // Worker state
@@ -52,7 +59,13 @@ let ctx: ImageBitmapRenderingContext | null;
 let currentScale: number = 4;
 let isModelSwitching: boolean = false;
 let pendingModelSwitch: SwitchModelData | null = null;
+let modelSwitchScheduled = false;
+let pendingPreviewRender: RenderPreviewData | null = null;
+let previewRenderScheduled = false;
+let previewOperationTail: Promise<void> = Promise.resolve();
 let cancelRequested: boolean = false;
+let finalizationInProgress: boolean = false;
+const DEFAULT_AUTO_TARGET_HEIGHT = 1080;
 
 class CancelledError extends Error {
   constructor() {
@@ -68,14 +81,92 @@ function throwIfCancelled(): void {
 }
 
 function cancelCurrentJob(): void {
+  if (finalizationInProgress) {
+    postMessage({
+      cmd: 'status',
+      data: 'Finalizing output; cancellation is no longer available.'
+    } satisfies WorkerResponseMessage);
+    return;
+  }
   cancelRequested = true;
 }
 
+function canSnapshotCanvas(canvas: OffscreenCanvas): boolean {
+  try {
+    const probe = new VideoFrame(canvas, { timestamp: 0, duration: 1 });
+    probe.close();
+    return true;
+  } catch (error) {
+    console.debug('Direct WebGPU canvas snapshots unavailable; using 2D mirror:', error);
+    return false;
+  }
+}
+
 /**
- * Check if WebGPU is supported in this environment.
+ * ONNX sessions and the shared preview canvases are not re-entrant. Keep model
+ * switches and preview renders on one serial queue even though worker message
+ * handlers themselves may overlap while awaiting async work.
+ */
+function enqueuePreviewOperation(operation: () => Promise<void>): Promise<void> {
+  const result = previewOperationTail.then(operation, operation);
+  previewOperationTail = result.catch(() => undefined);
+  return result;
+}
+
+/** Coalesce rapid resolution changes to the latest target while preserving order. */
+function queuePreviewRender(data: RenderPreviewData): Promise<void> {
+  pendingPreviewRender = data;
+  if (previewRenderScheduled) return previewOperationTail;
+
+  previewRenderScheduled = true;
+  return enqueuePreviewOperation(async () => {
+    try {
+      let renderSucceeded = true;
+      while (pendingPreviewRender) {
+        const nextRender = pendingPreviewRender;
+        pendingPreviewRender = null;
+        renderSucceeded = await rerenderPreview(nextRender);
+        if (!renderSucceeded) {
+          pendingPreviewRender = null;
+          break;
+        }
+      }
+      if (renderSucceeded) {
+        postMessage({ cmd: 'modelLoaded' } satisfies WorkerResponseMessage);
+      }
+    } finally {
+      previewRenderScheduled = false;
+    }
+  });
+}
+
+/** Coalesce rapid model choices while serializing them with preview renders. */
+function queueModelSwitch(data: SwitchModelData): Promise<void> {
+  pendingModelSwitch = data;
+  if (modelSwitchScheduled) return previewOperationTail;
+
+  modelSwitchScheduled = true;
+  return enqueuePreviewOperation(async () => {
+    try {
+      const nextSwitch = pendingModelSwitch;
+      pendingModelSwitch = null;
+      if (nextSwitch) {
+        await switchModel(nextSwitch);
+      }
+    } finally {
+      modelSwitchScheduled = false;
+    }
+  });
+}
+
+/**
+ * Check that the bundled ONNX Runtime fallback can initialize. WebGPU is
+ * detected later as an optional acceleration path for the selected model.
  */
 async function isSupported(): Promise<void> {
-  const supported = await Upscaler.isWebGPUSupported();
+  // WebGPU is an acceleration path, not a startup requirement. Initializing
+  // ORT here verifies the bundled WASM fallback used on non-WebGPU browsers.
+  const supported = await Upscaler.initORT();
 
   postMessage({
     cmd: 'isSupported',
@@ -225,6 +316,33 @@ async function switchModel(data: SwitchModelData): Promise<void> {
 }
 
 /**
+ * Re-render the retained preview frame for a new output cap without rebuilding
+ * or reloading the current ONNX session.
+ */
+async function rerenderPreview(data: RenderPreviewData): Promise<boolean> {
+  if (!upscaler || !upscaler.isReady()) {
+    postMessage({
+      cmd: 'error',
+      data: 'Upscaler model is not ready for preview rendering'
+    } satisfies WorkerResponseMessage);
+    return false;
+  }
+
+  try {
+    postMessage({ cmd: 'status', data: 'Rendering preview frame...' } satisfies WorkerResponseMessage);
+    await renderPreviewFrame(data.bitmap, data.targetHeight);
+    return true;
+  } catch (error) {
+    console.error('Failed to update preview resolution:', error);
+    postMessage({
+      cmd: 'error',
+      data: `Failed to update preview: ${error}`
+    } satisfies WorkerResponseMessage);
+    return false;
+  }
+}
+
+/**
  * Get the output format handler.
  */
 function getOutputFormat(format: OutputFormat) {
@@ -233,7 +351,10 @@ function getOutputFormat(format: OutputFormat) {
       return new WebMOutputFormat();
     case 'mp4':
     default:
-      return new Mp4OutputFormat();
+      // BufferTarget otherwise defaults to in-memory fast start, retaining
+      // encoded media packets until finalization. Explicitly write a normal MP4
+      // progressively; StreamTarget already uses this behavior by default.
+      return new Mp4OutputFormat({ fastStart: false });
   }
 }
 
@@ -299,18 +420,14 @@ function getMimeType(format: OutputFormat): string {
  * Resolution presets cap native model output instead of upscaling beyond it.
  */
 function getOutputResolution(targetHeight?: number): Resolution {
-  const nativeWidth = resolution.width * currentScale;
-  const nativeHeight = resolution.height * currentScale;
-
-  if (!targetHeight || nativeHeight <= targetHeight) {
-    return { width: nativeWidth, height: nativeHeight };
-  }
-
-  const aspectRatio = nativeWidth / nativeHeight;
-  const height = makeEven(targetHeight);
-  const width = makeEven(Math.round(height * aspectRatio));
-
-  return { width, height };
+  // Current callers resolve Auto on the main thread. Keep a deterministic,
+  // conservative fallback here so an omitted/legacy target never implies 8K.
+  return resolveOutputResolution(
+    resolution,
+    currentScale,
+    targetHeight,
+    DEFAULT_AUTO_TARGET_HEIGHT,
+  );
 }
 
 /**
@@ -326,22 +443,7 @@ function getEncodeResolution(settings: ProcessSettings): Resolution {
  * we do not spend time generating pixels that will be downscaled afterward.
  */
 function getInferenceResolution(encodeResolution: Resolution): Resolution {
-  const inputForEncodeWidth = makeEven(Math.round(encodeResolution.width / currentScale));
-  const inputForEncodeHeight = makeEven(Math.round(encodeResolution.height / currentScale));
-
-  if (inputForEncodeHeight >= resolution.height) {
-    return { width: resolution.width, height: resolution.height };
-  }
-
-  return {
-    width: Math.min(resolution.width, inputForEncodeWidth),
-    height: Math.min(resolution.height, inputForEncodeHeight),
-  };
-}
-
-function makeEven(value: number): number {
-  const rounded = Math.max(2, Math.round(value));
-  return rounded % 2 === 0 ? rounded : rounded - 1;
+  return resolveInferenceResolution(resolution, currentScale, encodeResolution);
 }
 
 function normalizeAudioPacketTimestamp(packet: EncodedPacket): EncodedPacket | null {
@@ -432,7 +534,10 @@ async function initRecording(
   let input: Input | null = null;
   let inferenceCanvas: OffscreenCanvas | null = null;
   let encodeCanvasForCleanup: OffscreenCanvas | null = null;
-  let writable: WritableStream | null = null;
+  let writable: WritableStream<StreamTargetChunk> | null = null;
+  let fileWritable: FileSystemWritableFileStream | null = null;
+  let fileTargetSettled = false;
+  let commitFileTarget = false;
   let audioSource: AudioSampleSource | null = null;
   let audioPacketSource: EncodedAudioPacketSource | null = null;
   let audioPacketSourceClosed = false;
@@ -440,6 +545,10 @@ async function initRecording(
   let output: Output | null = null;
   let outputFinalized = false;
   let wasCancelled = false;
+  let usesDirectGpuEncodeCanvas = false;
+  let videoIterator: AsyncIterator<VideoSample> | null = null;
+  let audioSampleIterator: AsyncIterator<AudioSample> | null = null;
+  let audioPacketIterator: AsyncIterator<EncodedPacket> | null = null;
   let pendingAudioSample: AudioSample | null = null;
 
   try {
@@ -470,7 +579,28 @@ async function initRecording(
 
     let target: BufferTarget | StreamTarget;
     if (outputHandle) {
-      writable = await outputHandle.createWritable();
+      fileWritable = await outputHandle.createWritable();
+      // MediaBunny locks the stream it receives. A small forwarding stream
+      // keeps the underlying file handle abortable and makes Output.cancel()
+      // discard the browser's temporary file instead of committing a partial
+      // result through WritableStream.close().
+      writable = new WritableStream<StreamTargetChunk>({
+        write: chunk => fileWritable!.write(chunk),
+        close: async () => {
+          if (fileTargetSettled) return;
+          if (commitFileTarget) {
+            await fileWritable!.close();
+          } else {
+            await fileWritable!.abort();
+          }
+          fileTargetSettled = true;
+        },
+        abort: async reason => {
+          if (fileTargetSettled) return;
+          await fileWritable!.abort(reason);
+          fileTargetSettled = true;
+        },
+      });
       // Coalesce writes into large chunks so the File System Access stream
       // does not receive one tiny write per muxer packet.
       target = new StreamTarget(writable, { chunked: true });
@@ -491,9 +621,24 @@ async function initRecording(
     const needsEncodeResize =
       encodeResolution.width !== renderOutputWidth ||
       encodeResolution.height !== renderOutputHeight;
-    const encodeCanvas = needsEncodeResize
-      ? new OffscreenCanvas(encodeResolution.width, encodeResolution.height)
-      : upscaled_canvas;
+    // When inference already produces the requested encode dimensions, bind
+    // CanvasSource directly to the renderer-owned WebGPU surface. This avoids
+    // WebGPU -> public 2D canvas -> encoder copies on every frame.
+    const candidateGpuEncodeCanvas = !needsEncodeResize
+      ? upscaler.getGpuOutputCanvas(renderOutputWidth, renderOutputHeight)
+      : null;
+    const directGpuEncodeCanvas = candidateGpuEncodeCanvas && canSnapshotCanvas(candidateGpuEncodeCanvas)
+      ? candidateGpuEncodeCanvas
+      : null;
+    if (candidateGpuEncodeCanvas && !directGpuEncodeCanvas) {
+      upscaler.releaseGpuOutputCanvas();
+    }
+    usesDirectGpuEncodeCanvas = directGpuEncodeCanvas !== null;
+    const encodeCanvas = directGpuEncodeCanvas ?? (
+      needsEncodeResize
+        ? new OffscreenCanvas(encodeResolution.width, encodeResolution.height)
+        : upscaled_canvas
+    );
     encodeCanvasForCleanup = needsEncodeResize ? encodeCanvas : null;
     const encodeCtx = needsEncodeResize
       ? encodeCanvas.getContext('2d', { alpha: false })
@@ -512,13 +657,43 @@ async function initRecording(
       encodeResolution.width,
       encodeResolution.height,
     );
+    let encoderConfig: VideoEncoderConfig | undefined;
+    let lastPipelineKey = '';
+    const getRenderPath = (): PipelineTelemetry['renderPath'] => {
+      if (usesDirectGpuEncodeCanvas) return 'webgpu-direct';
+      if (upscaler?.isUsingGPUPath()) {
+        return needsEncodeResize ? 'webgpu-2d-resize' : 'webgpu-2d-mirror';
+      }
+      return needsEncodeResize ? 'cpu-tensor-2d-resize' : 'cpu-tensor-direct-2d';
+    };
+    const reportPipeline = (force = false): void => {
+      const executionProvider = upscaler?.getExecutionProvider() ?? 'wasm';
+      const renderPath = getRenderPath();
+      const pipelineKey = `${executionProvider}:${renderPath}:${encoderConfig ? 'configured' : 'pending'}`;
+      if (!force && pipelineKey === lastPipelineKey) return;
+      lastPipelineKey = pipelineKey;
+      postMessage({
+        cmd: 'pipeline',
+        data: {
+          executionProvider,
+          renderPath,
+          ...(encoderConfig ? { encoderConfig } : {}),
+        },
+      } satisfies WorkerResponseMessage);
+    };
 
     videoSource = new CanvasSource(encodeCanvas, {
       codec,
       bitrate: QUALITY_HIGH,
       keyFrameInterval: 60,
       hardwareAcceleration,
+      onEncoderConfig: config => {
+        encoderConfig = { ...config };
+        // Forward every encoder reconfiguration, not only the first one.
+        reportPipeline(true);
+      },
     });
+    reportPipeline();
 
     // Preserve the source sample timestamps/durations instead of snapping all
     // output to a hard-coded 30 fps.  This avoids silently dropping temporal
@@ -529,8 +704,6 @@ async function initRecording(
     // Set up audio passthrough
     const audioTrack = await input.getPrimaryAudioTrack();
     let audioSink: AudioSampleSink | null = null;
-    let audioSampleIterator: AsyncIterator<AudioSample> | null = null;
-    let audioPacketIterator: AsyncIterator<EncodedPacket> | null = null;
     let pendingAudioPacket: EncodedPacket | null = null;
     let audioPacketMeta: EncodedAudioChunkMetadata | undefined;
 
@@ -589,6 +762,7 @@ async function initRecording(
     const videoSink = new VideoSampleSink(videoTrack);
     const duration = await input.computeDuration();
     const start_time = performance.now();
+    let lastFrameCompletedAt = start_time;
     let lastProgress = -1;
     let lastEta = '';
     let lastEtaAt = -Infinity;
@@ -596,6 +770,8 @@ async function initRecording(
     // Track audio progress separately
     const timingTotals: FrameTiming = {
       decodeMs: 0,
+      decodeWaitMs: 0,
+      frameConversionMs: 0,
       audioMs: 0,
       preprocessMs: 0,
       inferenceMs: 0,
@@ -604,6 +780,9 @@ async function initRecording(
       gpuTimestampMs: 0,
       canvasMs: 0,
       encodeMs: 0,
+      finalizeMs: 0,
+      wallFps: 0,
+      pipelineFps: 0,
       totalMs: 0,
       tileCount: 0,
       inputPixels: 0,
@@ -611,31 +790,42 @@ async function initRecording(
       frames: 0,
     };
 
+    function buildTimingReport(finalizeMs = 0, pipelineComplete = false): FrameTiming {
+      const frames = timingTotals.frames;
+      const frameLoopSeconds = Math.max((lastFrameCompletedAt - start_time) / 1000, 0.001);
+      const pipelineSeconds = Math.max((performance.now() - start_time) / 1000, 0.001);
+      return {
+        ...timingTotals,
+        decodeMs: timingTotals.decodeMs / frames,
+        decodeWaitMs: timingTotals.decodeWaitMs / frames,
+        frameConversionMs: timingTotals.frameConversionMs / frames,
+        audioMs: timingTotals.audioMs / frames,
+        preprocessMs: timingTotals.preprocessMs / frames,
+        inferenceMs: timingTotals.inferenceMs / frames,
+        postprocessMs: timingTotals.postprocessMs / frames,
+        gpuWaitMs: timingTotals.gpuWaitMs / frames,
+        gpuTimestampMs: timingTotals.gpuTimestampMs / frames,
+        canvasMs: timingTotals.canvasMs / frames,
+        encodeMs: timingTotals.encodeMs / frames,
+        finalizeMs,
+        wallFps: frames / frameLoopSeconds,
+        pipelineFps: pipelineComplete ? frames / pipelineSeconds : 0,
+        totalMs: timingTotals.totalMs / frames,
+        tileCount: timingTotals.tileCount / frames,
+        inputPixels: timingTotals.inputPixels / frames,
+        inferredPixels: timingTotals.inferredPixels / frames,
+      };
+    }
+
     function reportTiming(frameTiming: FrameTiming): void {
       for (const key of Object.keys(timingTotals) as Array<keyof FrameTiming>) {
         timingTotals[key] += frameTiming[key];
       }
 
       if (timingTotals.frames % 30 === 0) {
-        const frames = timingTotals.frames;
         postMessage({
           cmd: 'timing',
-          data: {
-            ...timingTotals,
-            decodeMs: timingTotals.decodeMs / frames,
-            audioMs: timingTotals.audioMs / frames,
-            preprocessMs: timingTotals.preprocessMs / frames,
-            inferenceMs: timingTotals.inferenceMs / frames,
-            postprocessMs: timingTotals.postprocessMs / frames,
-            gpuWaitMs: timingTotals.gpuWaitMs / frames,
-            gpuTimestampMs: timingTotals.gpuTimestampMs / frames,
-            canvasMs: timingTotals.canvasMs / frames,
-            encodeMs: timingTotals.encodeMs / frames,
-            totalMs: timingTotals.totalMs / frames,
-            tileCount: timingTotals.tileCount / frames,
-            inputPixels: timingTotals.inputPixels / frames,
-            inferredPixels: timingTotals.inferredPixels / frames,
-          },
+          data: buildTimingReport(),
         } satisfies WorkerResponseMessage);
       }
     }
@@ -723,16 +913,28 @@ async function initRecording(
 
         const audioSample = pendingAudioSample;
         pendingAudioSample = null;
-        await audioSource.add(audioSample);
-        audioSample.close();
+        try {
+          await audioSource.add(audioSample);
+        } finally {
+          audioSample.close();
+        }
       }
     }
 
-    // Loop over all frames
+    // Loop over all frames. Measure the async iterator wait itself: this is
+    // where MediaBunny performs demux/decode work. Timing only toVideoFrame()
+    // substantially underreported decoding cost.
     postMessage({ cmd: 'progress', data: 0 });
-    for await (const sample of videoSink.samples()) {
+    videoIterator = videoSink.samples()[Symbol.asyncIterator]();
+    while (true) {
+      const decodeWaitStarted = performance.now();
+      const nextVideo = await videoIterator.next();
+      const decodeWaitMs = performance.now() - decodeWaitStarted;
+      if (nextVideo.done || !nextVideo.value) break;
+
+      const sample = nextVideo.value;
       let videoFrame: VideoFrame | null = null;
-      const frameStarted = performance.now();
+      const frameStarted = decodeWaitStarted;
       try {
         throwIfCancelled();
 
@@ -741,9 +943,10 @@ async function initRecording(
         await processAudioUpTo(sample.timestamp + sample.duration);
         const audioMs = performance.now() - audioStarted;
 
-        const decodeStarted = performance.now();
+        const conversionStarted = performance.now();
         videoFrame = sample.toVideoFrame();
-        const decodeMs = performance.now() - decodeStarted;
+        const frameConversionMs = performance.now() - conversionStarted;
+        const decodeMs = decodeWaitMs + frameConversionMs;
         throwIfCancelled();
 
         // Render through upscaler (skip "before" preview during processing for speed)
@@ -755,11 +958,18 @@ async function initRecording(
             inferenceResolution.width,
             inferenceResolution.height
           );
-          await upscaler.render(inferenceCanvas);
+          await upscaler.render(inferenceCanvas, {
+            mirrorOutput: !usesDirectGpuEncodeCanvas,
+            requireGpuOutput: usesDirectGpuEncodeCanvas,
+          });
         } else {
-          await upscaler.render(videoFrame);
+          await upscaler.render(videoFrame, {
+            mirrorOutput: !usesDirectGpuEncodeCanvas,
+            requireGpuOutput: usesDirectGpuEncodeCanvas,
+          });
         }
         throwIfCancelled();
+        reportPipeline();
 
         const encodeStarted = performance.now();
         if (encodeCtx) {
@@ -775,11 +985,14 @@ async function initRecording(
         // Add frame to output video
         await videoSource.add(sample.timestamp, sample.duration);
         throwIfCancelled();
+        lastFrameCompletedAt = performance.now();
 
         const upscaleTiming = upscaler.getLastTiming();
         if (upscaleTiming) {
           reportTiming({
             decodeMs,
+            decodeWaitMs,
+            frameConversionMs,
             audioMs,
             preprocessMs: upscaleTiming.preprocessMs,
             inferenceMs: upscaleTiming.inferenceMs,
@@ -788,6 +1001,9 @@ async function initRecording(
             gpuTimestampMs: upscaleTiming.gpuTimestampMs,
             canvasMs: upscaleTiming.canvasMs,
             encodeMs: performance.now() - encodeStarted,
+            finalizeMs: 0,
+            wallFps: 0,
+            pipelineFps: 0,
             totalMs: performance.now() - frameStarted,
             tileCount: upscaleTiming.tileCount,
             inputPixels: upscaleTiming.inputPixels,
@@ -808,39 +1024,20 @@ async function initRecording(
     await processAudioUpTo(Number.POSITIVE_INFINITY);
     throwIfCancelled();
 
-    videoSource.close();
-    audioSource?.close();
-
-    if (audioPacketSource && !audioPacketSourceClosed) {
-      audioPacketSource.close();
-      audioPacketSourceClosed = true;
-    }
-
+    const finalizeStarted = performance.now();
+    finalizationInProgress = true;
+    postMessage({ cmd: 'status', data: 'Finalizing output...' } satisfies WorkerResponseMessage);
+    commitFileTarget = true;
     await output.finalize();
+    const finalizeMs = performance.now() - finalizeStarted;
     outputFinalized = true;
     postMessage({ cmd: 'progress', data: 100 });
     postMessage({ cmd: 'eta', data: prettyTime(0) });
 
-    if (timingTotals.frames > 0 && timingTotals.frames % 30 !== 0) {
-      const frames = timingTotals.frames;
+    if (timingTotals.frames > 0) {
       postMessage({
         cmd: 'timing',
-        data: {
-          ...timingTotals,
-          decodeMs: timingTotals.decodeMs / frames,
-          audioMs: timingTotals.audioMs / frames,
-          preprocessMs: timingTotals.preprocessMs / frames,
-          inferenceMs: timingTotals.inferenceMs / frames,
-          postprocessMs: timingTotals.postprocessMs / frames,
-          gpuWaitMs: timingTotals.gpuWaitMs / frames,
-          gpuTimestampMs: timingTotals.gpuTimestampMs / frames,
-          canvasMs: timingTotals.canvasMs / frames,
-          encodeMs: timingTotals.encodeMs / frames,
-          totalMs: timingTotals.totalMs / frames,
-          tileCount: timingTotals.tileCount / frames,
-          inputPixels: timingTotals.inputPixels / frames,
-          inferredPixels: timingTotals.inferredPixels / frames,
-        },
+        data: buildTimingReport(finalizeMs, true),
       } satisfies WorkerResponseMessage);
     }
 
@@ -851,6 +1048,7 @@ async function initRecording(
       postMessage({ cmd: 'finished', data: buffer }, [buffer]);
     }
   } catch (e) {
+    commitFileTarget = false;
     if (e instanceof CancelledError) {
       console.log('Video processing cancelled');
       wasCancelled = true;
@@ -868,38 +1066,10 @@ async function initRecording(
     // failed encode (and, for file-backed output, its writable stream) alive
     // until the worker was torn down.
     if (!outputFinalized) {
-      try {
-        videoSource?.close();
-      } catch {
-        // Ignore close errors while unwinding a failed/cancelled encode.
-      }
-
-      try {
-        audioSource?.close();
-      } catch {
-        // Ignore close errors while unwinding a failed/cancelled encode.
-      }
-
-      if (audioPacketSource && !audioPacketSourceClosed) {
-        try {
-          audioPacketSource.close();
-          audioPacketSourceClosed = true;
-        } catch {
-          // Ignore close errors while unwinding a failed/cancelled encode.
-        }
-      }
-
-      // Abort a file-backed target rather than committing a partial output.
-      // BufferTarget has no external resource and is released with the output
-      // object once this job returns.
-      if (writable) {
-        try {
-          await writable.abort();
-        } catch {
-          // Ignore writer abort errors after cancellation/error.
-        }
-      }
-
+      commitFileTarget = false;
+      // Let MediaBunny force-close encoders before closing its target writer.
+      // The forwarding stream converts that close into an underlying file
+      // abort while commitFileTarget is false.
       if (output && output.state !== 'canceled' && output.state !== 'finalized') {
         try {
           await output.cancel();
@@ -907,11 +1077,39 @@ async function initRecording(
           // Ignore output cancellation errors while unwinding.
         }
       }
+
+      if (fileWritable && !fileTargetSettled) {
+        try {
+          await fileWritable.abort();
+          fileTargetSettled = true;
+        } catch {
+          // Ignore file abort errors after cancellation/error.
+        }
+      }
+
+      // MediaBunny currently leaves an Output in its non-cancelable
+      // `finalizing` state if finalize() itself rejects. File-backed output is
+      // still safely aborted above; discard any partial in-memory target here
+      // so a failed mux does not retain a potentially large ArrayBuffer until
+      // the dependency-owned Output is garbage-collected.
+      if (output?.target instanceof BufferTarget) {
+        output.target.buffer = null;
+      }
     }
 
     cancelRequested = false;
+    await Promise.allSettled([
+      (async () => videoIterator?.return?.())(),
+      (async () => audioSampleIterator?.return?.())(),
+      (async () => audioPacketIterator?.return?.())(),
+    ]);
+    finalizationInProgress = false;
+    videoIterator = null;
+    audioSampleIterator = null;
+    audioPacketIterator = null;
     pendingAudioSample?.close();
     pendingAudioSample = null;
+    upscaler?.releaseGpuOutputCanvas();
     upscaler?.clearFrameResources();
     input?.dispose();
 
@@ -961,8 +1159,14 @@ self.onmessage = async function (event: MessageEvent<WorkerRequestMessage>) {
       await isSupported();
       break;
 
-    case 'switchModel':
-      await switchModel(event.data.data);
+    case 'switchModel': {
+      const switchData = event.data.data;
+      await queueModelSwitch(switchData);
+      break;
+    }
+
+    case 'renderPreview':
+      await queuePreviewRender(event.data.data);
       break;
 
     case 'process':

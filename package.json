@@ -9,10 +9,13 @@
     "serve": "webpack serve --mode development",
     "type-check": "tsc --noEmit",
     "benchmark:tiling": "node scripts/benchmark-tiling.cjs",
+    "verify:tile-placement": "node scripts/verify-tile-placement.cjs",
+    "verify:resolution": "node scripts/verify-output-resolution.cjs",
     "verify:onnx-rewrite": "node scripts/verify-onnx-rewrite.cjs",
     "benchmark:webgpu": "webpack --config scripts/gpu-benchmark.webpack.cjs --mode development",
     "benchmark:clip": "webpack --config scripts/clip-regression.webpack.cjs --mode development",
-    "benchmark:encoding": "webpack --config scripts/encoding-benchmark.webpack.cjs --mode development"
+    "benchmark:encoding": "webpack --config scripts/encoding-benchmark.webpack.cjs --mode development",
+    "benchmark:encoding:serve": "webpack serve --config scripts/encoding-benchmark.webpack.cjs --mode development"
   },
   "repository": {
     "type": "git",

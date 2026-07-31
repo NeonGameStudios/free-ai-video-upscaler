@@ -123,27 +123,62 @@ WebGPU initialization requests the high-performance adapter on macOS when the
 browser exposes more than one adapter, avoiding an accidental low-power GPU
 selection for inference.
 
+### 16. Browser Upscaling Performance And Reliability
+
+The browser pipeline now uploads or converts each decoded source frame once,
+then reuses that frame across all inference tiles. WebGPU sessions keep
+preprocessing, ONNX inference, overlap composition, and presentation on the
+GPU while reusing external ORT tensors, buffers, textures, uniforms, and bind
+groups for stable tile shapes. Tile placement now preserves the crop offset in
+the destination coordinate, with deterministic border, seam, odd-dimension,
+and coverage regressions.
+
+When the inference result already matches the requested encode resolution, the
+hardware encoder can consume a renderer-owned WebGPU canvas directly. Browsers
+that cannot snapshot that surface use the compatible 2D mirror, and validation
+or runtime GPU failures fall back safely or stop before encoding a stale frame.
+Packed float16 shaders, fixed-shape models, and padded edge tiles use corrected
+indexing and edge extension; unsupported AnimeJaNai WebGPU graphs continue to
+fall back to WASM.
+
+Auto output resolution now uses conservative browser hardware signals and no
+longer turns 1080p input into an implicit 8K job. Small outputs retain the
+download-in-memory flow, while large or unknown-duration jobs stream directly
+to a user-selected file. Cancellation aborts temporary streamed output where
+the browser permits it.
+
+Worker telemetry and the browser encoding benchmark now separate decoder wait,
+frame conversion, preprocess, inference, postprocess, GPU wait/timestamps,
+canvas work, encoding, finalization, frame-loop FPS, and full-pipeline FPS. The
+benchmark records the actual execution provider, render path, encoder config,
+tile/pixel work, percentile timings, output bytes, and border/seam validation.
+See the README performance section for commands, parameters, measured local
+results, and the limitations of those measurements.
+
 ## Remaining
 
 ### 1. RVRT / VRT Temporal Video Restoration
 
 Investigate RVRT or VRT for temporal cleanup across multiple frames. This is deferred because these models need multi-frame input windows or recurrent state, which requires a different worker pipeline than the current frame-by-frame renderer.
 
-### 2. Full End-To-End Clip Encoding Benchmark
+### 2. Full-Duration Visual And Thermal Validation
 
-`benchmark:encoding` now uses both repository clips as fixed inputs and runs
-480p, 720p, and 1080p target-height cases. It records:
+`benchmark:encoding` now provides the repeatable end-to-end harness using both
+repository clips and configurable target heights, warmup counts, frame limits,
+tile sizes, GPU timestamps, models, and direct-versus-mirrored encoder surfaces.
+What remains is running longer idle-machine trials that cover a complete clip,
+reach a stable thermal state, and compare representative output resolutions.
+Those runs should record:
 
-- model selected
-- input and output resolution
-- per-frame render time
-- total encode time
-- output file size
-- a deterministic pixel checksum for visual sanity checks
+- repeated-run median and variability
+- full-duration throughput and finalization time
+- sustained CPU, GPU, and memory behavior
+- border, seam, and full-frame visual comparisons against a trusted reference
+- model/content recommendations based on retained output files
 
-The default run can be bounded with `clip`, `targets`, and `frames` query
-parameters while comparing experimental branches. Full-duration runs remain
-useful for final validation of snow/corruption across the complete output.
+The short July 31 direct-canvas A/B intentionally used a capped 960x540 output
+and one inference tile to isolate encoder-surface overhead. It must not be read
+as representative throughput for a full 960x540-to-4K upscale.
 
 ### 3. Model/Content Recommendations
 

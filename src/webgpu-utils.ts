@@ -14,6 +14,7 @@ import postprocessShaderF32 from './shaders/postprocess.wgsl';
 import preprocessShaderF16 from './shaders/preprocess-f16.wgsl';
 import postprocessShaderF16 from './shaders/postprocess-f16.wgsl';
 import compositeShader from './shaders/composite.wgsl';
+import { calculateTileCopyRegion } from './tiling';
 
 export interface WebGPUContext {
   device: GPUDevice;
@@ -57,8 +58,13 @@ export interface GPUBufferPool {
 export interface GPUFrameTile {
   sourceX: number;
   sourceY: number;
+  /** Valid source pixels represented by this tile. */
   inputWidth: number;
   inputHeight: number;
+  /** Model tensor shape after fixed-shape/input-multiple edge padding. */
+  tensorWidth: number;
+  tensorHeight: number;
+  /** Absolute output origin before the kept-region crop is applied. */
   destinationX: number;
   destinationY: number;
   keepStartX: number;
@@ -77,31 +83,39 @@ export interface GPUFrameTiming {
 }
 
 /**
- * Tiled WebGPU bridge for float32 ONNX models.
+ * Tiled WebGPU bridge for float32 and packed-float16 ONNX models.
  *
- * The renderer deliberately owns a separate WebGPU canvas. The public output
- * canvas remains a 2D canvas for preview and CanvasSource compatibility; only
- * one GPU-to-canvas draw is performed after all tiles are composited.
+ * The renderer deliberately owns a separate WebGPU canvas. Preview renders
+ * mirror once to the public 2D canvas; matching-size recording jobs can lease
+ * the GPU canvas directly to CanvasSource and skip that readback entirely.
  */
 export class GPUFrameRenderer {
   private readonly device: GPUDevice;
   private readonly session: ort.InferenceSession;
   private readonly scale: number;
   private readonly context: WebGPUContext;
+  private readonly inputFloat16: boolean;
+  private readonly outputFloat16: boolean;
   private readonly gpuTimestampsEnabled: boolean;
   private gpuCanvas: OffscreenCanvas | null = null;
   private gpuCanvasContext: GPUCanvasContext | null = null;
+  private directOutputLease: { width: number; height: number } | null = null;
   private inputTexture: GPUTexture | null = null;
   private inputBuffer: GPUBuffer | null = null;
+  private outputBuffer: GPUBuffer | null = null;
   private outputTexture: GPUTexture | null = null;
   private compositeTexture: GPUTexture | null = null;
   private inputTextureView: GPUTextureView | null = null;
   private outputTextureView: GPUTextureView | null = null;
   private compositeTextureView: GPUTextureView | null = null;
   private preprocessBindGroup: GPUBindGroup | null = null;
+  private postprocessBindGroup: GPUBindGroup | null = null;
   private compositeBindGroup: GPUBindGroup | null = null;
+  private inputTensor: ort.Tensor | null = null;
+  private outputTensor: ort.Tensor | null = null;
   private preprocessParams: GPUBuffer | null = null;
   private postprocessParams: GPUBuffer | null = null;
+  private readonly preprocessParamsData = new Uint32Array(8);
   private timestampQuerySet: GPUQuerySet | null = null;
   private timestampResolveBuffer: GPUBuffer | null = null;
   private timestampReadbackBuffer: GPUBuffer | null = null;
@@ -109,6 +123,8 @@ export class GPUFrameRenderer {
   private tileInputHeight = 0;
   private tileOutputWidth = 0;
   private tileOutputHeight = 0;
+  private sourceWidth = 0;
+  private sourceHeight = 0;
   private outputWidth = 0;
   private outputHeight = 0;
   private lastTiming: GPUFrameTiming = {
@@ -125,12 +141,16 @@ export class GPUFrameRenderer {
     session: ort.InferenceSession,
     scale: number,
     context: WebGPUContext,
+    inputFloat16: boolean,
+    outputFloat16: boolean,
     gpuTimestampsEnabled: boolean
   ) {
     this.device = device;
     this.session = session;
     this.scale = scale;
     this.context = context;
+    this.inputFloat16 = inputFloat16;
+    this.outputFloat16 = outputFloat16;
     this.gpuTimestampsEnabled = gpuTimestampsEnabled;
     this.initializeTimestampQueries();
   }
@@ -138,13 +158,23 @@ export class GPUFrameRenderer {
   static async create(
     session: ort.InferenceSession,
     scale: number,
+    inputFloat16: boolean,
+    outputFloat16: boolean,
     gpuTimestampsEnabled = false
   ): Promise<GPUFrameRenderer | null> {
     try {
       const device = await (ort.env as any).webgpu?.device as GPUDevice | undefined;
       if (!device) return null;
       const context = await initWebGPUContext(device);
-      return new GPUFrameRenderer(device, session, scale, context, gpuTimestampsEnabled);
+      return new GPUFrameRenderer(
+        device,
+        session,
+        scale,
+        context,
+        inputFloat16,
+        outputFloat16,
+        gpuTimestampsEnabled
+      );
     } catch (error) {
       console.warn('GPU frame renderer unavailable:', error);
       return null;
@@ -152,18 +182,22 @@ export class GPUFrameRenderer {
   }
 
   private ensureResources(
+    sourceWidth: number,
+    sourceHeight: number,
     outputWidth: number,
     outputHeight: number,
-    tileInputWidth: number,
-    tileInputHeight: number
+    tileTensorWidth: number,
+    tileTensorHeight: number
   ): void {
-    const tileOutputWidth = tileInputWidth * this.scale;
-    const tileOutputHeight = tileInputHeight * this.scale;
+    const tileOutputWidth = tileTensorWidth * this.scale;
+    const tileOutputHeight = tileTensorHeight * this.scale;
     const dimensionsChanged =
+      this.sourceWidth !== sourceWidth ||
+      this.sourceHeight !== sourceHeight ||
       this.outputWidth !== outputWidth ||
       this.outputHeight !== outputHeight ||
-      this.tileInputWidth !== tileInputWidth ||
-      this.tileInputHeight !== tileInputHeight;
+      this.tileInputWidth !== tileTensorWidth ||
+      this.tileInputHeight !== tileTensorHeight;
 
     if (!dimensionsChanged) return;
 
@@ -171,40 +205,35 @@ export class GPUFrameRenderer {
 
     this.outputWidth = outputWidth;
     this.outputHeight = outputHeight;
-    this.tileInputWidth = tileInputWidth;
-    this.tileInputHeight = tileInputHeight;
+    this.sourceWidth = sourceWidth;
+    this.sourceHeight = sourceHeight;
+    this.tileInputWidth = tileTensorWidth;
+    this.tileInputHeight = tileTensorHeight;
     this.tileOutputWidth = tileOutputWidth;
     this.tileOutputHeight = tileOutputHeight;
 
-    this.gpuCanvas = new OffscreenCanvas(outputWidth, outputHeight);
-    // OffscreenCanvas.getContext() is typed as a union of all rendering
-    // contexts; the requested context string narrows this at runtime.
-    this.gpuCanvasContext = this.gpuCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
-    if (!this.gpuCanvasContext) {
-      throw new Error('Unable to create WebGPU output canvas');
-    }
-    this.gpuCanvasContext.configure({
-      device: this.device,
-      format: this.context.canvasFormat,
-      // The canvas swapchain is only used as a render attachment. Tile
-      // compositing happens in a regular texture below; copying directly into
-      // a swapchain texture is rejected by Chromium on some Metal drivers.
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
-      // The compositor always writes opaque pixels; avoid premultiplied-alpha
-      // conversion on the Mac swapchain.
-      alphaMode: 'opaque',
-    });
+    this.ensurePresentationCanvas(outputWidth, outputHeight);
 
     this.inputTexture = this.device.createTexture({
-      size: [tileInputWidth, tileInputHeight],
+      // Import the decoded source once per frame; tile origins are handled by
+      // the preprocess uniform rather than repeated external-image copies.
+      size: [sourceWidth, sourceHeight],
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING |
         GPUTextureUsage.COPY_DST |
+        // Dawn's copyExternalImageToTexture validation requires external-image
+        // destinations to be renderable as well as copy destinations.
         GPUTextureUsage.RENDER_ATTACHMENT,
     });
+    const inputElementBytes = this.inputFloat16 ? 2 : 4;
+    const outputElementBytes = this.outputFloat16 ? 2 : 4;
     this.inputBuffer = this.device.createBuffer({
-      size: alignTo16(3 * tileInputWidth * tileInputHeight * 4),
+      size: alignTo16(3 * tileTensorWidth * tileTensorHeight * inputElementBytes),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.outputBuffer = this.device.createBuffer({
+      size: alignTo16(3 * tileOutputWidth * tileOutputHeight * outputElementBytes),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
     this.outputTexture = this.device.createTexture({
       size: [tileOutputWidth, tileOutputHeight],
@@ -221,18 +250,13 @@ export class GPUFrameRenderer {
         GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.preprocessParams = this.device.createBuffer({
-      size: 16,
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.postprocessParams = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    this.device.queue.writeBuffer(
-      this.preprocessParams,
-      0,
-      new Uint32Array([tileInputWidth, tileInputHeight])
-    );
     this.device.queue.writeBuffer(
       this.postprocessParams,
       0,
@@ -252,10 +276,70 @@ export class GPUFrameRenderer {
         { binding: 2, resource: { buffer: this.preprocessParams } },
       ],
     });
+    const inputDataType = this.inputFloat16 ? 'float16' : 'float32';
+    const outputDataType = this.outputFloat16 ? 'float16' : 'float32';
+    this.inputTensor = ort.Tensor.fromGpuBuffer(this.inputBuffer, {
+      dataType: inputDataType,
+      dims: [1, 3, tileTensorHeight, tileTensorWidth],
+    });
+    this.outputTensor = ort.Tensor.fromGpuBuffer(this.outputBuffer, {
+      dataType: outputDataType,
+      dims: [1, 3, tileOutputHeight, tileOutputWidth],
+    });
+    this.postprocessBindGroup = this.device.createBindGroup({
+      layout: this.context.bindGroupLayouts.postprocess,
+      entries: [
+        { binding: 0, resource: { buffer: this.outputBuffer } },
+        { binding: 1, resource: this.outputTextureView },
+        { binding: 2, resource: { buffer: this.postprocessParams } },
+      ],
+    });
     this.compositeBindGroup = this.device.createBindGroup({
       layout: this.context.bindGroupLayouts.composite,
       entries: [{ binding: 0, resource: this.compositeTextureView }],
     });
+  }
+
+  private ensurePresentationCanvas(outputWidth: number, outputHeight: number): void {
+    if (
+      this.gpuCanvas &&
+      this.gpuCanvasContext &&
+      this.gpuCanvas.width === outputWidth &&
+      this.gpuCanvas.height === outputHeight
+    ) {
+      return;
+    }
+
+    if (this.directOutputLease) {
+      throw new Error(
+        `Direct GPU output is leased at ${this.directOutputLease.width}x${this.directOutputLease.height}; ` +
+        `cannot replace it with ${outputWidth}x${outputHeight}`
+      );
+    }
+
+    this.gpuCanvas = new OffscreenCanvas(outputWidth, outputHeight);
+    // OffscreenCanvas.getContext() is typed as a union of all rendering
+    // contexts; the requested context string narrows this at runtime.
+    this.gpuCanvasContext = this.gpuCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
+    if (!this.gpuCanvasContext) {
+      throw new Error('Unable to create WebGPU output canvas');
+    }
+    this.gpuCanvasContext.configure({
+      device: this.device,
+      format: this.context.canvasFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      alphaMode: 'opaque',
+    });
+  }
+
+  getOutputCanvas(outputWidth: number, outputHeight: number): OffscreenCanvas {
+    this.ensurePresentationCanvas(outputWidth, outputHeight);
+    this.directOutputLease = { width: outputWidth, height: outputHeight };
+    return this.gpuCanvas!;
+  }
+
+  releaseOutputCanvas(): void {
+    this.directOutputLease = null;
   }
 
   private initializeTimestampQueries(): void {
@@ -308,9 +392,57 @@ export class GPUFrameRenderer {
   async render(
     source: ImageBitmap | VideoFrame | OffscreenCanvas,
     outputCanvas: OffscreenCanvas,
+    sourceWidth: number,
+    sourceHeight: number,
     outputWidth: number,
     outputHeight: number,
-    tiles: readonly GPUFrameTile[]
+    tiles: readonly GPUFrameTile[],
+    mirrorOutput = true
+  ): Promise<void> {
+    // WebGPU validation failures are otherwise reported only as uncaptured
+    // console events and can silently encode an empty/stale frame. Scope the
+    // whole frame so the caller can fall back (or abort a leased direct
+    // surface) instead of accepting corrupted output.
+    this.device.pushErrorScope('validation');
+    let renderFailure: unknown = null;
+
+    try {
+      await this.renderUnchecked(
+        source,
+        outputCanvas,
+        sourceWidth,
+        sourceHeight,
+        outputWidth,
+        outputHeight,
+        tiles,
+        mirrorOutput,
+      );
+    } catch (error) {
+      renderFailure = error;
+    }
+
+    let validationFailure: GPUError | null = null;
+    try {
+      validationFailure = await this.device.popErrorScope();
+    } catch (error) {
+      if (!renderFailure) renderFailure = error;
+    }
+
+    if (renderFailure) throw renderFailure;
+    if (validationFailure) {
+      throw new Error(`WebGPU frame validation failed: ${validationFailure.message}`);
+    }
+  }
+
+  private async renderUnchecked(
+    source: ImageBitmap | VideoFrame | OffscreenCanvas,
+    outputCanvas: OffscreenCanvas,
+    sourceWidth: number,
+    sourceHeight: number,
+    outputWidth: number,
+    outputHeight: number,
+    tiles: readonly GPUFrameTile[],
+    mirrorOutput: boolean,
   ): Promise<void> {
     if (tiles.length === 0) return;
     const now = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -324,214 +456,202 @@ export class GPUFrameRenderer {
     };
     const firstTile = tiles[0];
     this.ensureResources(
+      sourceWidth,
+      sourceHeight,
       outputWidth,
       outputHeight,
-      firstTile.inputWidth,
-      firstTile.inputHeight
+      firstTile.tensorWidth,
+      firstTile.tensorHeight
     );
 
     if (!this.gpuCanvasContext || !this.inputTexture || !this.inputBuffer ||
-        !this.outputTexture || !this.compositeTexture || !this.preprocessParams ||
-        !this.postprocessParams || !this.compositeBindGroup) {
+        !this.outputBuffer || !this.outputTexture || !this.compositeTexture ||
+        !this.preprocessParams || !this.postprocessParams || !this.inputTensor ||
+        !this.outputTensor || !this.postprocessBindGroup || !this.compositeBindGroup) {
       throw new Error('GPU frame renderer resources are unavailable');
     }
 
-    // Acquire the swapchain texture once. The final presentation pass is
-    // appended to the last tile submission below, so the compositor and
-    // presentation share one queue submit.
-    const presentTexture = this.gpuCanvasContext.getCurrentTexture();
     const inputName = this.session.inputNames[0];
     const outputName = this.session.outputNames[0];
 
-    const pendingResources: Array<{ output: ort.Tensor; input: ort.Tensor }> = [];
-    // Retain a small output window before fencing. Four tiles reduce queue
-    // synchronization for large frames while bounding GPU memory growth.
-    const maxPendingTiles = Math.min(Math.max(tiles.length, 1), 4);
+    const sourceUploadStarted = now();
+    this.device.queue.copyExternalImageToTexture(
+      { source },
+      { texture: this.inputTexture },
+      [sourceWidth, sourceHeight]
+    );
+    timing.preprocessMs += now() - sourceUploadStarted;
 
-    const flushPending = async (): Promise<void> => {
-      if (pendingResources.length === 0) return;
-
-      const resources = pendingResources.splice(0, pendingResources.length);
-      const fenceStarted = now();
-      try {
-        await this.device.queue.onSubmittedWorkDone();
-        timing.gpuWaitMs += now() - fenceStarted;
-      } finally {
-        // ORT may recycle GPU output buffers after dispose(), so release them
-        // only after postprocess and tile-copy commands have completed.
-        for (const resource of resources) {
-          resource.output.dispose();
-          resource.input.dispose();
-        }
+    for (let tileIndex = 0; tileIndex < tiles.length; tileIndex++) {
+      const tile = tiles[tileIndex];
+      if (tile.tensorWidth !== this.tileInputWidth || tile.tensorHeight !== this.tileInputHeight) {
+        throw new Error('GPU frame renderer requires one tensor shape per frame');
       }
-    };
+      if (tile.inputWidth <= 0 || tile.inputHeight <= 0 ||
+          tile.inputWidth > tile.tensorWidth || tile.inputHeight > tile.tensorHeight) {
+        throw new Error('GPU frame tile has invalid source/tensor dimensions');
+      }
 
-    try {
-      for (let tileIndex = 0; tileIndex < tiles.length; tileIndex++) {
-        const tile = tiles[tileIndex];
-        if (tile.inputWidth !== this.tileInputWidth || tile.inputHeight !== this.tileInputHeight) {
-          throw new Error('GPU frame renderer requires one tile shape per frame');
-        }
-
-        const preprocessStarted = now();
-        this.device.queue.copyExternalImageToTexture(
-          {
-            source,
-            origin: { x: tile.sourceX, y: tile.sourceY },
-          },
-          { texture: this.inputTexture },
-          [tile.inputWidth, tile.inputHeight]
-        );
-
-        const encoder = this.device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(this.context.pipelines.preprocessF32);
-        pass.setBindGroup(0, this.preprocessBindGroup!);
+      const preprocessStarted = now();
+      this.preprocessParamsData.set([
+        tile.tensorWidth,
+        tile.tensorHeight,
+        tile.sourceX,
+        tile.sourceY,
+        tile.inputWidth,
+        tile.inputHeight,
+      ]);
+      this.device.queue.writeBuffer(this.preprocessParams, 0, this.preprocessParamsData);
+      const encoder = this.device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(
+        this.inputFloat16
+          ? this.context.pipelines.preprocessF16
+          : this.context.pipelines.preprocessF32
+      );
+      pass.setBindGroup(0, this.preprocessBindGroup!);
+      if (this.inputFloat16) {
+        const packedValueCount = Math.ceil(3 * tile.tensorWidth * tile.tensorHeight / 2);
+        pass.dispatchWorkgroups(Math.ceil(packedValueCount / 256));
+      } else {
         pass.dispatchWorkgroups(
-          Math.ceil(tile.inputWidth / 16),
-          Math.ceil(tile.inputHeight / 16)
+          Math.ceil(tile.tensorWidth / 16),
+          Math.ceil(tile.tensorHeight / 16)
         );
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
-        timing.preprocessMs += now() - preprocessStarted;
+      }
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+      timing.preprocessMs += now() - preprocessStarted;
 
-        const inputTensor = ort.Tensor.fromGpuBuffer(this.inputBuffer, {
-          dataType: 'float32',
-          dims: [1, 3, tile.inputHeight, tile.inputWidth],
-        });
-        const inferenceStarted = now();
-        let outputs: ort.InferenceSession.OnnxValueMapType;
-        try {
-          outputs = await this.session.run({ [inputName]: inputTensor });
-        } catch (error) {
-          inputTensor.dispose();
-          throw error;
-        }
-        timing.inferenceMs += now() - inferenceStarted;
-        const output = outputs[outputName];
-        let queued = false;
+      const inferenceStarted = now();
+      const outputs = await this.session.run(
+        { [inputName]: this.inputTensor },
+        { [outputName]: this.outputTensor }
+      );
+      timing.inferenceMs += now() - inferenceStarted;
+      const output = outputs[outputName];
+      if (!output || output.location !== 'gpu-buffer') {
+        throw new Error('ONNX Runtime returned a CPU output for GPU rendering');
+      }
+      if (output.gpuBuffer !== this.outputBuffer) {
+        throw new Error('ONNX Runtime did not bind the preallocated GPU output buffer');
+      }
+      const modelOutputWidth = Number(output.dims[3]);
+      const modelOutputHeight = Number(output.dims[2]);
+      if (modelOutputWidth !== this.tileOutputWidth || modelOutputHeight !== this.tileOutputHeight) {
+        throw new Error('ONNX output shape does not match GPU tile resources');
+      }
 
-        try {
-          if (!output || output.location !== 'gpu-buffer') {
-            throw new Error('ONNX Runtime returned a CPU output for GPU rendering');
-          }
-          const outputWidth = Number(output.dims[3]);
-          const outputHeight = Number(output.dims[2]);
-          if (outputWidth !== this.tileOutputWidth || outputHeight !== this.tileOutputHeight) {
-            throw new Error('ONNX output shape does not match GPU tile resources');
-          }
-
-          const postprocessStarted = now();
-          const postprocessBindGroup = this.device.createBindGroup({
-            layout: this.context.bindGroupLayouts.postprocess,
-            entries: [
-              { binding: 0, resource: { buffer: output.gpuBuffer } },
-              { binding: 1, resource: this.outputTextureView! },
-              { binding: 2, resource: { buffer: this.postprocessParams } },
-            ],
-          });
-          const postprocessEncoder = this.device.createCommandEncoder();
-          const postprocessPass = postprocessEncoder.beginComputePass(
-            this.timestampQuerySet && tileIndex === 0
-              ? {
-                timestampWrites: {
-                  querySet: this.timestampQuerySet,
-                  beginningOfPassWriteIndex: 0,
-                  endOfPassWriteIndex: 1,
-                },
-              }
-              : undefined
-          );
-          postprocessPass.setPipeline(this.context.pipelines.postprocessF32);
-          postprocessPass.setBindGroup(0, postprocessBindGroup);
-          postprocessPass.dispatchWorkgroups(
-            Math.ceil(this.tileOutputWidth / 16),
-            Math.ceil(this.tileOutputHeight / 16)
-          );
-          postprocessPass.end();
-          postprocessEncoder.copyTextureToTexture(
-            {
-              texture: this.outputTexture,
-              origin: { x: tile.keepStartX, y: tile.keepStartY },
+      const postprocessStarted = now();
+      const postprocessEncoder = this.device.createCommandEncoder();
+      const postprocessPass = postprocessEncoder.beginComputePass(
+        this.timestampQuerySet && tileIndex === 0
+          ? {
+            timestampWrites: {
+              querySet: this.timestampQuerySet,
+              beginningOfPassWriteIndex: 0,
+              endOfPassWriteIndex: 1,
             },
-            {
-              texture: this.compositeTexture,
-              origin: { x: tile.destinationX, y: tile.destinationY },
-            },
-            [tile.keepWidth, tile.keepHeight]
-          );
+          }
+          : undefined
+      );
+      postprocessPass.setPipeline(
+        this.outputFloat16
+          ? this.context.pipelines.postprocessF16
+          : this.context.pipelines.postprocessF32
+      );
+      postprocessPass.setBindGroup(0, this.postprocessBindGroup);
+      postprocessPass.dispatchWorkgroups(
+        Math.ceil(this.tileOutputWidth / 16),
+        Math.ceil(this.tileOutputHeight / 16)
+      );
+      postprocessPass.end();
+      const copyRegion = calculateTileCopyRegion({
+        tileOutputX: tile.destinationX,
+        tileOutputY: tile.destinationY,
+        cropX: tile.keepStartX,
+        cropY: tile.keepStartY,
+        width: tile.keepWidth,
+        height: tile.keepHeight,
+      });
+      postprocessEncoder.copyTextureToTexture(
+        {
+          texture: this.outputTexture,
+          origin: { x: copyRegion.sourceX, y: copyRegion.sourceY },
+        },
+        {
+          texture: this.compositeTexture,
+          origin: { x: copyRegion.destinationX, y: copyRegion.destinationY },
+        },
+        [copyRegion.width, copyRegion.height]
+      );
 
-          if (tileIndex === tiles.length - 1) {
-            const presentPass = postprocessEncoder.beginRenderPass({
-              colorAttachments: [{
-                view: presentTexture.createView(),
-                loadOp: 'clear',
-                storeOp: 'store',
-                clearValue: { r: 0, g: 0, b: 0, a: 1 },
-              }],
-              ...(this.timestampQuerySet
-                ? {
-                  timestampWrites: {
-                    querySet: this.timestampQuerySet,
-                    beginningOfPassWriteIndex: 2,
-                    endOfPassWriteIndex: 3,
-                  },
-                }
-                : {}),
-            });
-            presentPass.setPipeline(this.context.pipelines.composite);
-            presentPass.setBindGroup(0, this.compositeBindGroup);
-            presentPass.draw(3);
-            presentPass.end();
-
-            if (this.timestampQuerySet && this.timestampResolveBuffer && this.timestampReadbackBuffer) {
-              postprocessEncoder.resolveQuerySet(
-                this.timestampQuerySet,
-                0,
-                4,
-                this.timestampResolveBuffer,
-                0
-              );
-              postprocessEncoder.copyBufferToBuffer(
-                this.timestampResolveBuffer,
-                0,
-                this.timestampReadbackBuffer,
-                0,
-                32
-              );
+      if (tileIndex === tiles.length - 1) {
+        // Canvas textures can expire across an await/rendering update. Acquire
+        // immediately before the synchronous encode+submit sequence instead
+        // of retaining one across the ORT session.run() calls above.
+        const presentTexture = this.gpuCanvasContext.getCurrentTexture();
+        const presentPass = postprocessEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: presentTexture.createView(),
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          }],
+          ...(this.timestampQuerySet
+            ? {
+              timestampWrites: {
+                querySet: this.timestampQuerySet,
+                beginningOfPassWriteIndex: 2,
+                endOfPassWriteIndex: 3,
+              },
             }
-          }
+            : {}),
+        });
+        presentPass.setPipeline(this.context.pipelines.composite);
+        presentPass.setBindGroup(0, this.compositeBindGroup);
+        presentPass.draw(3);
+        presentPass.end();
 
-          this.device.queue.submit([postprocessEncoder.finish()]);
-          timing.postprocessMs += now() - postprocessStarted;
-          pendingResources.push({ output, input: inputTensor });
-          queued = true;
-
-          if (pendingResources.length >= maxPendingTiles) {
-            await flushPending();
-          }
-        } finally {
-          if (!queued) {
-            output?.dispose();
-            inputTensor.dispose();
-          }
+        if (this.timestampQuerySet && this.timestampResolveBuffer && this.timestampReadbackBuffer) {
+          postprocessEncoder.resolveQuerySet(
+            this.timestampQuerySet,
+            0,
+            4,
+            this.timestampResolveBuffer,
+            0
+          );
+          postprocessEncoder.copyBufferToBuffer(
+            this.timestampResolveBuffer,
+            0,
+            this.timestampReadbackBuffer,
+            0,
+            32
+          );
         }
       }
 
-      await flushPending();
-      timing.gpuTimestampMs = await this.readTimestampMs();
-    } finally {
-      // Ensure resources submitted before an exception are released too.
-      await flushPending();
+      this.device.queue.submit([postprocessEncoder.finish()]);
+      timing.postprocessMs += now() - postprocessStarted;
     }
 
-    const canvasStarted = now();
-    const outputContext = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
-    if (!outputContext || !this.gpuCanvas) {
-      throw new Error('Unable to mirror GPU output to the public canvas');
+    // One frame fence replaces the previous four-output allocation window and
+    // per-window waits. Stable external input/output buffers are safe because
+    // preprocess, ORT, postprocess, and presentation share one ordered queue.
+    const fenceStarted = now();
+    await this.device.queue.onSubmittedWorkDone();
+    timing.gpuWaitMs = now() - fenceStarted;
+    timing.gpuTimestampMs = await this.readTimestampMs();
+
+    if (mirrorOutput) {
+      const canvasStarted = now();
+      const outputContext = outputCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+      if (!outputContext || !this.gpuCanvas) {
+        throw new Error('Unable to mirror GPU output to the public canvas');
+      }
+      outputContext.drawImage(this.gpuCanvas, 0, 0, outputWidth, outputHeight);
+      timing.canvasMs = now() - canvasStarted;
     }
-    outputContext.drawImage(this.gpuCanvas, 0, 0, outputWidth, outputHeight);
-    timing.canvasMs = now() - canvasStarted;
     this.lastTiming = timing;
   }
 
@@ -542,6 +662,7 @@ export class GPUFrameRenderer {
   dispose(): void {
     this.destroyTileResources();
     this.destroyTimestampResources();
+    this.directOutputLease = null;
     this.gpuCanvas = null;
     this.gpuCanvasContext = null;
   }
@@ -556,20 +677,27 @@ export class GPUFrameRenderer {
   }
 
   private destroyTileResources(): void {
+    this.inputTensor?.dispose();
+    this.outputTensor?.dispose();
+    this.inputTensor = null;
+    this.outputTensor = null;
     this.inputTexture?.destroy();
     this.inputBuffer?.destroy();
+    this.outputBuffer?.destroy();
     this.outputTexture?.destroy();
     this.compositeTexture?.destroy();
     this.preprocessParams?.destroy();
     this.postprocessParams?.destroy();
     this.inputTexture = null;
     this.inputBuffer = null;
+    this.outputBuffer = null;
     this.outputTexture = null;
     this.compositeTexture = null;
     this.inputTextureView = null;
     this.outputTextureView = null;
     this.compositeTextureView = null;
     this.preprocessBindGroup = null;
+    this.postprocessBindGroup = null;
     this.compositeBindGroup = null;
     this.preprocessParams = null;
     this.postprocessParams = null;
@@ -717,9 +845,8 @@ export function createBufferPool(
   const inputPixels = inputWidth * inputHeight;
   const outputPixels = outputWidth * outputHeight;
 
-  // For float32: 4 bytes per value, 3 channels
-  // For float16: 2 bytes per value, but we use u32 storage (4 bytes) for alignment
-  const bytesPerValue = useFloat16 ? 4 : 4; // Both use 4 bytes per slot in our shaders
+  // Packed float16 tensors use two scalar values per u32 word.
+  const bytesPerValue = useFloat16 ? 2 : 4;
   const inputBufferSize = alignTo16(3 * inputPixels * bytesPerValue);
   const outputBufferSize = alignTo16(3 * outputPixels * bytesPerValue);
 
@@ -735,13 +862,13 @@ export function createBufferPool(
   // Input buffer (NCHW data for ONNX)
   const inputBuffer = device.createBuffer({
     size: inputBufferSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
   // Output buffer (NCHW data from ONNX)
   const outputBuffer = device.createBuffer({
     size: outputBufferSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
   // Output texture (for canvas rendering)
@@ -753,7 +880,7 @@ export function createBufferPool(
 
   // Uniform buffers for shader parameters
   const preprocessParams = device.createBuffer({
-    size: 16, // 2 x u32 + padding
+    size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -763,7 +890,11 @@ export function createBufferPool(
   });
 
   // Initialize uniform buffers
-  device.queue.writeBuffer(preprocessParams, 0, new Uint32Array([inputWidth, inputHeight]));
+  device.queue.writeBuffer(
+    preprocessParams,
+    0,
+    new Uint32Array([inputWidth, inputHeight, 0, 0, inputWidth, inputHeight, 0, 0])
+  );
   device.queue.writeBuffer(postprocessParams, 0, new Uint32Array([outputWidth, outputHeight]));
 
   return {
@@ -808,10 +939,15 @@ export function runPreprocessShader(
   passEncoder.setPipeline(pipeline);
   passEncoder.setBindGroup(0, bindGroup);
 
-  // Dispatch workgroups (16x16 threads each)
-  const workgroupsX = Math.ceil(pool.inputWidth / 16);
-  const workgroupsY = Math.ceil(pool.inputHeight / 16);
-  passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
+  if (pool.useFloat16) {
+    const packedValueCount = Math.ceil(3 * pool.inputWidth * pool.inputHeight / 2);
+    passEncoder.dispatchWorkgroups(Math.ceil(packedValueCount / 256));
+  } else {
+    passEncoder.dispatchWorkgroups(
+      Math.ceil(pool.inputWidth / 16),
+      Math.ceil(pool.inputHeight / 16)
+    );
+  }
 
   passEncoder.end();
   device.queue.submit([commandEncoder.finish()]);

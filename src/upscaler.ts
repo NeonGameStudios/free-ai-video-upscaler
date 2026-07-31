@@ -93,7 +93,26 @@ export interface UpscalerConfig {
   enableGpuTimestamps?: boolean;
 }
 
-export type UpscaleTiming = Omit<FrameTiming, 'decodeMs' | 'audioMs' | 'encodeMs' | 'totalMs' | 'frames'>;
+export interface RenderOptions {
+  /** Skip the GPU-to-2D preview copy when an encoder consumes the GPU canvas. */
+  mirrorOutput?: boolean;
+  /** Do not silently switch canvases if a direct GPU encode render fails. */
+  requireGpuOutput?: boolean;
+}
+
+export type UpscaleTiming = Omit<
+  FrameTiming,
+  | 'decodeMs'
+  | 'decodeWaitMs'
+  | 'frameConversionMs'
+  | 'audioMs'
+  | 'encodeMs'
+  | 'finalizeMs'
+  | 'wallFps'
+  | 'pipelineFps'
+  | 'totalMs'
+  | 'frames'
+>;
 
 // Default configuration
 const DEFAULT_CONFIG: UpscalerConfig = {
@@ -129,6 +148,14 @@ export class Upscaler {
   private inputFloat16: Uint16Array | null = null;
   private videoFramePixels: Uint8Array | null = null;
   private videoFrameCopySupported: boolean | null = null;
+  private sourcePixelsCanvas: OffscreenCanvas | null = null;
+  private sourcePixelsCtx: OffscreenCanvasRenderingContext2D | null = null;
+  private preparedSource: UpscaleSource | null = null;
+  private preparedSourcePixels: Uint8Array | Uint8ClampedArray | null = null;
+  private preparedSourceOffset = 0;
+  private preparedSourceStride = 0;
+  private preparedSourceWidth = 0;
+  private preparedSourceHeight = 0;
   private outputImageData: ImageData | null = null;
   private lastTiming: UpscaleTiming | null = null;
   private gpuRenderer: GPUFrameRenderer | null = null;
@@ -272,13 +299,14 @@ export class Upscaler {
     this.canvas = outputCanvas;
     this.ctx = outputCanvas.getContext('2d', { alpha: false }) as OffscreenCanvasRenderingContext2D;
 
-    // The GPU bridge currently supports dynamic float32 models only. Models
-    // with fixed or padded input shapes stay on the verified CPU path until
-    // their shader padding and compositing paths are validated.
+    // The GPU bridge handles float32/packed-float16 tensors and reproduces CPU
+    // edge padding for fixed-shape and input-multiple models.
     if (this.executionProvider === 'webgpu' && this.supportsGpuFrameRenderer()) {
       this.gpuRenderer = await GPUFrameRenderer.create(
         this.session,
         this.config.scale,
+        this.useFloat16,
+        this.useFloat16 && !this.outputDataIsFloat32,
         this.config.enableGpuTimestamps === true
       );
     }
@@ -303,10 +331,9 @@ export class Upscaler {
     };
 
     if (provider === 'webgpu') {
-      // Only the dynamic float32 bridge consumes GPU-resident outputs directly.
-      // Fixed-shape, padded, and float16 models use the CPU postprocess path;
-      // asking ORT for gpu-buffer outputs there would force a GPU->CPU readback
-      // for every tile in getTensorData().
+      // The validated GPU bridge consumes GPU-resident outputs directly for
+      // float32, float16, fixed-shape, and padded inputs. If renderer creation
+      // later fails, getTensorData() remains a correct (slower) fallback.
       sessionOptions.preferredOutputLocation = this.supportsGpuFrameRenderer()
         ? 'gpu-buffer'
         : 'cpu';
@@ -486,6 +513,27 @@ export class Upscaler {
       throw new Error(`Source tile ${width}x${height} exceeds model input ${tensorWidth}x${tensorHeight}`);
     }
 
+    // Tiled CPU/WASM rendering prepares one packed RGBA view for the entire
+    // source frame. Gather each tile from that shared view instead of asking
+    // WebCodecs or Canvas2D to convert/read back the same frame once per tile.
+    if (
+      this.preparedSource === source &&
+      this.preparedSourcePixels &&
+      sx >= 0 && sy >= 0 &&
+      sx + width <= this.preparedSourceWidth &&
+      sy + height <= this.preparedSourceHeight
+    ) {
+      return this.createTensorFromRgba(
+        this.preparedSourcePixels,
+        this.preparedSourceOffset + sy * this.preparedSourceStride + sx * 4,
+        this.preparedSourceStride,
+        width,
+        height,
+        tensorWidth,
+        tensorHeight,
+      );
+    }
+
     const videoFrame = this.getVideoFrame(source);
     if (videoFrame && this.videoFrameCopySupported !== false) {
       const copied = await this.preprocessVideoFrame(
@@ -585,6 +633,111 @@ export class Upscaler {
   }
 
   /**
+   * Prepare one RGBA view for a CPU/WASM frame. The common unrotated
+   * VideoFrame path uses copyTo() directly; other sources use one full-frame
+   * Canvas2D readback. Both paths replace per-tile source conversion with
+   * simple strided gathers into the model tensors.
+   */
+  private async prepareSourcePixels(source: UpscaleSource): Promise<void> {
+    this.releasePreparedSource();
+
+    const { width, height } = this.getSourceDimensions(source);
+    const videoFrame = this.getVideoFrame(source);
+
+    if (videoFrame && this.videoFrameCopySupported !== false) {
+      try {
+        const requiredBytes = videoFrame.allocationSize({ format: 'RGBA' });
+        if (!this.videoFramePixels || this.videoFramePixels.byteLength < requiredBytes) {
+          this.videoFramePixels = new Uint8Array(requiredBytes);
+        }
+
+        const layout = await videoFrame.copyTo(this.videoFramePixels, { format: 'RGBA' });
+        const plane = layout[0];
+        if (!plane) {
+          throw new Error('VideoFrame.copyTo returned no RGBA plane');
+        }
+
+        this.videoFrameCopySupported = true;
+        this.preparedSource = source;
+        this.preparedSourcePixels = this.videoFramePixels;
+        this.preparedSourceOffset = plane.offset;
+        this.preparedSourceStride = plane.stride;
+        this.preparedSourceWidth = width;
+        this.preparedSourceHeight = height;
+        return;
+      } catch (error) {
+        console.debug('Whole-frame VideoFrame.copyTo RGBA unavailable; using canvas preprocessing:', error);
+        this.videoFrameCopySupported = false;
+      }
+    }
+
+    // The worker already draws resize-required frames into a 2D
+    // OffscreenCanvas. Read that backing store directly instead of copying it
+    // into a second full-frame canvas before getImageData().
+    if (typeof OffscreenCanvas !== 'undefined' && source instanceof OffscreenCanvas) {
+      try {
+        const directContext = source.getContext('2d', {
+          alpha: false,
+          willReadFrequently: true,
+        }) as OffscreenCanvasRenderingContext2D | null;
+        if (directContext) {
+          const imageData = directContext.getImageData(0, 0, width, height);
+          this.preparedSource = source;
+          this.preparedSourcePixels = imageData.data;
+          this.preparedSourceOffset = 0;
+          this.preparedSourceStride = width * 4;
+          this.preparedSourceWidth = width;
+          this.preparedSourceHeight = height;
+          return;
+        }
+      } catch (error) {
+        console.debug('Direct OffscreenCanvas readback unavailable; copying once for preprocessing:', error);
+      }
+    }
+
+    try {
+      if (
+        !this.sourcePixelsCanvas ||
+        this.sourcePixelsCanvas.width !== width ||
+        this.sourcePixelsCanvas.height !== height
+      ) {
+        this.sourcePixelsCanvas = new OffscreenCanvas(width, height);
+        this.sourcePixelsCtx = this.sourcePixelsCanvas.getContext('2d', {
+          alpha: false,
+          willReadFrequently: true,
+        }) as OffscreenCanvasRenderingContext2D | null;
+      }
+
+      if (!this.sourcePixelsCtx) {
+        throw new Error('Unable to create whole-frame preprocessing context');
+      }
+
+      this.sourcePixelsCtx.drawImage(source, 0, 0, width, height);
+      const imageData = this.sourcePixelsCtx.getImageData(0, 0, width, height);
+      this.preparedSource = source;
+      this.preparedSourcePixels = imageData.data;
+      this.preparedSourceOffset = 0;
+      this.preparedSourceStride = width * 4;
+      this.preparedSourceWidth = width;
+      this.preparedSourceHeight = height;
+    } catch (error) {
+      // Retain the existing per-tile canvas path as a correctness fallback for
+      // browsers or source formats that cannot produce a full-frame readback.
+      console.debug('Whole-frame RGBA preprocessing unavailable; using per-tile fallback:', error);
+      this.releasePreparedSource();
+    }
+  }
+
+  private releasePreparedSource(): void {
+    this.preparedSource = null;
+    this.preparedSourcePixels = null;
+    this.preparedSourceOffset = 0;
+    this.preparedSourceStride = 0;
+    this.preparedSourceWidth = 0;
+    this.preparedSourceHeight = 0;
+  }
+
+  /**
    * Fast CPU/WASM preprocessing path for decoded VideoFrames. WebCodecs can
    * convert the frame directly into packed RGBA bytes, avoiding a canvas draw
    * and readback for every tile. Any unsupported format/browser falls back to
@@ -633,7 +786,7 @@ export class Upscaler {
   }
 
   private createTensorFromRgba(
-    pixels: Uint8Array,
+    pixels: Uint8Array | Uint8ClampedArray,
     offset: number,
     stride: number,
     width: number,
@@ -694,12 +847,7 @@ export class Upscaler {
   }
 
   private supportsGpuFrameRenderer(): boolean {
-    return (
-      !this.useFloat16 &&
-      !this.config.inputWidth &&
-      !this.config.inputHeight &&
-      (this.config.inputMultiple || 1) <= 1
-    );
+    return true;
   }
 
   private alignToInputMultiple(value: number): number {
@@ -834,7 +982,7 @@ export class Upscaler {
    * Upscale an image/video frame using tiled processing.
    * This helps manage GPU memory for large images.
    */
-  async upscale(source: UpscaleSource): Promise<void> {
+  async upscale(source: UpscaleSource, options: RenderOptions = {}): Promise<void> {
     if (!this.initialized || !this.session || !this.canvas || !this.ctx) {
       throw new Error('Upscaler not initialized');
     }
@@ -897,6 +1045,8 @@ export class Upscaler {
         sourceY,
         inputWidth: inputTileWidth,
         inputHeight: inputTileHeight,
+        tensorWidth: this.config.inputWidth ?? this.alignToInputMultiple(inputTileWidth),
+        tensorHeight: this.config.inputHeight ?? this.alignToInputMultiple(inputTileHeight),
         destinationX: sourceX * scale,
         destinationY: sourceY * scale,
         keepStartX,
@@ -918,9 +1068,12 @@ export class Upscaler {
         await this.gpuRenderer.render(
           source,
           this.canvas,
+          inputWidth,
+          inputHeight,
           outputWidth,
           outputHeight,
-          gpuTiles
+          gpuTiles,
+          options.mirrorOutput !== false
         );
         const gpuTiming = this.gpuRenderer.getLastTiming();
         timing.preprocessMs = gpuTiming.preprocessMs;
@@ -931,115 +1084,128 @@ export class Upscaler {
         timing.canvasMs = gpuTiming.canvasMs;
         timing.tileCount = gpuTiles.length;
         timing.inferredPixels = gpuTiles.reduce(
-          (total, tile) => total + tile.inputWidth * tile.inputHeight,
+          (total, tile) => total + tile.tensorWidth * tile.tensorHeight,
           0
         );
         this.lastTiming = timing;
         return;
       } catch (error) {
-        console.warn('GPU tiled render failed; falling back to CPU path:', error);
+        console.warn('GPU tiled render failed:', error);
         this.gpuRenderer.dispose();
         this.gpuRenderer = null;
+        if (options.requireGpuOutput) {
+          throw error;
+        }
+        console.warn('Falling back to the CPU tensor path');
       }
     }
 
-    // For small images, process in one go
-    if (inputWidth <= tileSize && inputHeight <= tileSize) {
-      let tensor: ort.Tensor | null = null;
-      let output: ort.Tensor | null = null;
-      try {
-        const preprocessStarted = now();
-        const preprocessed = await this.preprocess(source);
-        timing.preprocessMs += now() - preprocessStarted;
-        tensor = preprocessed.tensor;
-        const inferenceStarted = now();
-        output = await this.upscaleTile(tensor);
-        timing.inferenceMs += now() - inferenceStarted;
-        timing.inferredPixels += inputWidth * inputHeight;
-        const postprocessStarted = now();
-        const imageData = await this.postprocess(output, inputWidth, inputHeight);
-        timing.postprocessMs += now() - postprocessStarted;
-        const canvasStarted = now();
-        this.ctx.putImageData(imageData, 0, 0);
-        timing.canvasMs += now() - canvasStarted;
-        timing.tileCount = 1;
-      } finally {
-        tensor?.dispose();
-        output?.dispose();
-      }
-      this.lastTiming = timing;
-      return;
-    }
+    const sourcePreparationStarted = now();
+    await this.prepareSourcePixels(source);
+    timing.preprocessMs += now() - sourcePreparationStarted;
 
-    // Tiled processing for larger images. Use one stable, adaptive tile shape
-    // per axis so remainder tiles do not get clamped back to full size.
-    for (let ty = 0; ty < tilesY; ty++) {
-      for (let tx = 0; tx < tilesX; tx++) {
+    try {
+      // For small images, process in one go
+      if (inputWidth <= tileSize && inputHeight <= tileSize) {
         let tensor: ort.Tensor | null = null;
         let output: ort.Tensor | null = null;
-
         try {
-          const tile = getTile(tx, ty);
-          const actualSrcX = tile.sourceX;
-          const actualSrcY = tile.sourceY;
-          const srcW = tile.inputWidth;
-          const srcH = tile.inputHeight;
-
-          // Process tile directly from the source frame to avoid extra canvas/bitmap copies.
           const preprocessStarted = now();
-          const preprocessed = await this.preprocess(source, actualSrcX, actualSrcY, srcW, srcH);
+          const preprocessed = await this.preprocess(source);
           timing.preprocessMs += now() - preprocessStarted;
           tensor = preprocessed.tensor;
           const inferenceStarted = now();
           output = await this.upscaleTile(tensor);
           timing.inferenceMs += now() - inferenceStarted;
-          timing.inferredPixels += srcW * srcH;
+          const tensorWidth = this.config.inputWidth ?? this.alignToInputMultiple(inputWidth);
+          const tensorHeight = this.config.inputHeight ?? this.alignToInputMultiple(inputHeight);
+          timing.inferredPixels += tensorWidth * tensorHeight;
           const postprocessStarted = now();
-          const outputImageData = await this.postprocess(output, srcW, srcH);
+          const imageData = await this.postprocess(output, inputWidth, inputHeight);
           timing.postprocessMs += now() - postprocessStarted;
-
-          // Calculate destination position in output
-          const dstX = actualSrcX * scale;
-          const dstY = actualSrcY * scale;
-
-          // Keep exactly the same overlap crop as the GPU compositor. The
-          // effective padding is clamped by the tile planner for tiny/fixed
-          // model shapes, so it can never produce a negative dirty rectangle.
-          const keepStartX = tile.keepStartX;
-          const keepStartY = tile.keepStartY;
-          const keepW = tile.keepWidth;
-          const keepH = tile.keepHeight;
-
-          // putImageData applies dirtyX/dirtyY on top of dx/dy, so dx/dy must be
-          // the full tile origin rather than the cropped region origin.
           const canvasStarted = now();
-          this.ctx.putImageData(
-            outputImageData,
-            dstX,
-            dstY,
-            keepStartX,
-            keepStartY,
-            keepW,
-            keepH
-          );
+          this.ctx.putImageData(imageData, 0, 0);
           timing.canvasMs += now() - canvasStarted;
-          timing.tileCount += 1;
+          timing.tileCount = 1;
         } finally {
-          // Cleanup - always dispose even on error
           tensor?.dispose();
           output?.dispose();
         }
+        this.lastTiming = timing;
+        return;
       }
-    }
 
-    this.lastTiming = timing;
+      // Tiled processing for larger images. Use one stable, adaptive tile shape
+      // per axis so remainder tiles do not get clamped back to full size.
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          let tensor: ort.Tensor | null = null;
+          let output: ort.Tensor | null = null;
+
+          try {
+            const tile = getTile(tx, ty);
+            const actualSrcX = tile.sourceX;
+            const actualSrcY = tile.sourceY;
+            const srcW = tile.inputWidth;
+            const srcH = tile.inputHeight;
+
+            const preprocessStarted = now();
+            const preprocessed = await this.preprocess(source, actualSrcX, actualSrcY, srcW, srcH);
+            timing.preprocessMs += now() - preprocessStarted;
+            tensor = preprocessed.tensor;
+            const inferenceStarted = now();
+            output = await this.upscaleTile(tensor);
+            timing.inferenceMs += now() - inferenceStarted;
+            timing.inferredPixels += tile.tensorWidth * tile.tensorHeight;
+            const postprocessStarted = now();
+            const outputImageData = await this.postprocess(output, srcW, srcH);
+            timing.postprocessMs += now() - postprocessStarted;
+
+            const dstX = actualSrcX * scale;
+            const dstY = actualSrcY * scale;
+            const canvasStarted = now();
+            this.ctx.putImageData(
+              outputImageData,
+              dstX,
+              dstY,
+              tile.keepStartX,
+              tile.keepStartY,
+              tile.keepWidth,
+              tile.keepHeight
+            );
+            timing.canvasMs += now() - canvasStarted;
+            timing.tileCount += 1;
+          } finally {
+            tensor?.dispose();
+            output?.dispose();
+          }
+        }
+      }
+
+      this.lastTiming = timing;
+    } finally {
+      // Never retain a VideoFrame or ImageData view after the frame finishes.
+      this.releasePreparedSource();
+    }
   }
 
   /**
    * Render a frame directly (simplified path for video processing).
    */
-  async render(frame: UpscaleSource): Promise<void> {
-    await this.upscale(frame);
+  async render(frame: UpscaleSource, options: RenderOptions = {}): Promise<void> {
+    await this.upscale(frame, options);
+  }
+
+  /**
+   * Return the renderer-owned WebGPU canvas for zero-copy CanvasSource input.
+   * Callers must request the same dimensions they pass through render().
+   */
+  getGpuOutputCanvas(width: number, height: number): OffscreenCanvas | null {
+    return this.gpuRenderer?.getOutputCanvas(width, height) ?? null;
+  }
+
+  releaseGpuOutputCanvas(): void {
+    this.gpuRenderer?.releaseOutputCanvas();
   }
 
   /**
@@ -1076,8 +1242,11 @@ export class Upscaler {
   }
 
   clearFrameResources(): void {
+    this.releasePreparedSource();
     this.preprocessCanvas = null;
     this.preprocessCtx = null;
+    this.sourcePixelsCanvas = null;
+    this.sourcePixelsCtx = null;
     this.inputFloat32 = null;
     this.inputFloat16 = null;
     this.videoFramePixels = null;

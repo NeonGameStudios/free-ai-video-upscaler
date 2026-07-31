@@ -14,6 +14,7 @@ import {
   getModelInfo,
   getFormatInfo,
   getResolutionPreset,
+  resolveOutputResolution,
 } from './types/worker-messages';
 import type {
   WorkerRequestMessage,
@@ -68,8 +69,41 @@ let currentModel: ModelType = 'realesr-animevideov3';
 let currentDenoiseLevel: DenoiseLevel = 0;
 let currentOutputFormat: OutputFormat = 'mp4';
 let currentOutputResolution: OutputResolution = 'auto';
-const MAX_AUTO_PREVIEW_HEIGHT = 1080;
+let upscaleOutputResolutionBeforeCleanup: OutputResolution = 'auto';
 const MAX_CLEANUP_PREVIEW_HEIGHT = 144;
+const AUTO_OUTPUT_HEIGHT_CAP = detectAutoOutputHeightCap();
+const AUDIO_BITRATE_BPS = 128_000;
+// Blob-backed output remains resident in browser memory until the download is
+// released. Keep the convenience path deliberately small and stream larger
+// files through the File System Access API instead.
+const MAX_IN_MEMORY_OUTPUT_BYTES = 192 * 1024 * 1024;
+
+/**
+ * Choose a conservative automatic output cap from coarse browser hardware
+ * signals. `deviceMemory` is Chromium-only, so hardwareConcurrency provides a
+ * deterministic fallback and unknown environments use the safest cap.
+ */
+function detectAutoOutputHeightCap(): number {
+    if (typeof navigator === 'undefined') return 1080;
+
+    const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+    const hardwareThreads = navigator.hardwareConcurrency || 0;
+
+    if (typeof deviceMemory === 'number' && Number.isFinite(deviceMemory)) {
+        if (deviceMemory >= 8 && hardwareThreads >= 8) return 2160;
+        if (deviceMemory >= 4 && hardwareThreads >= 4) return 1440;
+        return 1080;
+    }
+
+    if (hardwareThreads >= 8) return 1440;
+    return 1080;
+}
+
+function getAutoOutputLabel(): string {
+    if (AUTO_OUTPUT_HEIGHT_CAP >= 2160) return '4K';
+    if (AUTO_OUTPUT_HEIGHT_CAP >= 1440) return '1440p';
+    return '1080p';
+}
 
 // Video data
 let download_name: string;
@@ -162,8 +196,8 @@ declare global {
         onDenoiseChange: (level: number) => Promise<void>;
         onFormatChange: (format: string) => void;
         onResolutionChange: (resolution: string) => void;
-        showSaveFilePicker: (options?: any) => Promise<FileSystemFileHandle>;
-        showOpenFilePicker: (options?: any) => Promise<FileSystemFileHandle[]>;
+        showSaveFilePicker?: (options?: any) => Promise<FileSystemFileHandle>;
+        showOpenFilePicker?: (options?: any) => Promise<FileSystemFileHandle[]>;
     }
 }
 
@@ -199,7 +233,11 @@ async function index(): Promise<void> {
     Alpine.store('models', modelsWithAvailability);
     Alpine.store('modelGroups', modelGroups);
     Alpine.store('formats', OUTPUT_FORMATS);
-    Alpine.store('resolutions', RESOLUTION_PRESETS);
+    Alpine.store('resolutions', RESOLUTION_PRESETS.map(preset => (
+        preset.id === 'auto'
+            ? { ...preset, name: `Auto (hardware cap: ${getAutoOutputLabel()})` }
+            : preset
+    )));
 
     Alpine.store('selectedModel', currentModel);
     Alpine.store('selectedDenoise', currentDenoiseLevel);
@@ -218,8 +256,6 @@ async function index(): Promise<void> {
     original_canvas = document.getElementById('original') as HTMLCanvasElement;
 
     if (!("VideoEncoder" in window)) return showUnsupported("WebCodecs");
-
-    if (!window.showSaveFilePicker) return showUnsupported("File Write System API");
 
     worker.postMessage({ cmd: 'isSupported' } satisfies WorkerRequestMessage);
 
@@ -241,9 +277,58 @@ function showUnsupported(text: string): void {
 }
 
 /**
- * Prompt user to choose a video file using File System Access API.
+ * Return true only for an explicit browser-picker cancellation. Permission,
+ * security, and I/O failures should remain visible to the user.
+ */
+function isAbortError(error: unknown): boolean {
+    return typeof error === 'object'
+        && error !== null
+        && 'name' in error
+        && (error as { name?: unknown }).name === 'AbortError';
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Use a normal file input when showOpenFilePicker is unavailable (notably in
+ * Safari and Firefox). File objects still remain blob-backed and are streamed
+ * by MediaBunny; this does not read the whole input into an ArrayBuffer.
+ */
+function chooseFileWithInput(): void {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.mp4,.m4v,.webm,.mkv,video/mp4,video/webm,video/x-matroska';
+    input.hidden = true;
+
+    const cleanup = () => input.remove();
+    input.addEventListener('cancel', cleanup, { once: true });
+    input.addEventListener('change', () => {
+        const file = input.files?.[0];
+        cleanup();
+        if (!file) return;
+
+        void loadVideo(file).catch(error => {
+            console.error('Failed to open input file:', error);
+            showError(`Failed to open video: ${errorMessage(error)}`);
+        });
+    }, { once: true });
+
+    document.body.append(input);
+    input.click();
+}
+
+/**
+ * Prompt the user for a video through File System Access when available, with
+ * a regular file-input fallback for browsers that do not expose that API.
  */
 async function chooseFile(e?: Event): Promise<void> {
+    if (typeof window.showOpenFilePicker !== 'function') {
+        chooseFileWithInput();
+        return;
+    }
+
     try {
         const [fileHandle] = await window.showOpenFilePicker({
             types: [{
@@ -258,9 +343,14 @@ async function chooseFile(e?: Event): Promise<void> {
         });
 
         await loadVideo(fileHandle);
-    } catch (e) {
-        // User cancelled file picker
-        console.log('File selection cancelled');
+    } catch (error) {
+        if (isAbortError(error)) {
+            console.log('File selection cancelled');
+            return;
+        }
+
+        console.error('Failed to open input file:', error);
+        showError(`Failed to open video: ${errorMessage(error)}`);
     }
 }
 
@@ -279,6 +369,14 @@ async function onModelChange(modelId: string): Promise<void> {
         return;
     }
 
+    const previousModelInfo = getModelInfo(currentModel);
+    const enteringCleanup = previousModelInfo?.scale !== 1 && modelInfo.scale === 1;
+    const leavingCleanup = previousModelInfo?.scale === 1 && modelInfo.scale !== 1;
+
+    if (enteringCleanup) {
+        upscaleOutputResolutionBeforeCleanup = currentOutputResolution;
+    }
+
     currentModel = modelId as ModelType;
     Alpine.store('selectedModel', currentModel);
     Alpine.store('currentScale', modelInfo.scale);
@@ -293,11 +391,15 @@ async function onModelChange(modelId: string): Promise<void> {
     if (modelInfo.scale === 1) {
         currentOutputResolution = 'source';
         Alpine.store('selectedResolution', currentOutputResolution);
+    } else if (leavingCleanup) {
+        currentOutputResolution = upscaleOutputResolutionBeforeCleanup;
+        Alpine.store('selectedResolution', currentOutputResolution);
     }
 
     // Update output dimensions display
     if (video) {
         updateOutputDimensions();
+        updateOutputEstimateAndTarget();
     }
     updateDownloadName();
 
@@ -351,6 +453,7 @@ function onFormatChange(format: string): void {
     currentOutputFormat = format as OutputFormat;
     Alpine.store('selectedFormat', currentOutputFormat);
     updateDownloadName();
+    updateOutputEstimateAndTarget();
 }
 
 /**
@@ -358,9 +461,25 @@ function onFormatChange(format: string): void {
  */
 function onResolutionChange(resolution: string): void {
     currentOutputResolution = resolution as OutputResolution;
+    if ((getModelInfo(currentModel)?.scale || 1) !== 1) {
+        upscaleOutputResolutionBeforeCleanup = currentOutputResolution;
+    }
     Alpine.store('selectedResolution', currentOutputResolution);
     updateOutputDimensions();
     updateDownloadName();
+    updateOutputEstimateAndTarget();
+
+    if (previewBitmap && Alpine.store('state') === 'preview') {
+        Alpine.store('state', 'loading');
+        Alpine.store('loading_message', 'Updating preview resolution...');
+        worker.postMessage({
+            cmd: 'renderPreview',
+            data: {
+                bitmap: previewBitmap,
+                targetHeight: getPreviewTargetHeight(),
+            },
+        } satisfies WorkerRequestMessage);
+    }
 }
 
 /**
@@ -388,30 +507,20 @@ function getModelConfig(): ModelConfig {
  * Update output dimensions display based on current settings.
  */
 function updateOutputDimensions(): void {
-    if (!video) return;
-
-    if (currentOutputResolution === 'source') {
-        Alpine.store('outputWidth', video.videoWidth);
-        Alpine.store('outputHeight', video.videoHeight);
-        return;
-    }
+    if (!video?.videoWidth || !video.videoHeight) return;
 
     const modelInfo = getModelInfo(currentModel);
     const scale = modelInfo?.scale || 4;
-    const resPreset = getResolutionPreset(currentOutputResolution);
-
-    let outputWidth = video.videoWidth * scale;
-    let outputHeight = video.videoHeight * scale;
-
-    // Apply resolution limit if not auto
-    if (resPreset && resPreset.maxHeight !== null && outputHeight > resPreset.maxHeight) {
-        const aspectRatio = outputWidth / outputHeight;
-        outputHeight = resPreset.maxHeight;
-        outputWidth = Math.round(outputHeight * aspectRatio);
-    }
+    const { width: outputWidth, height: outputHeight } = resolveOutputResolution(
+        { width: video.videoWidth, height: video.videoHeight },
+        scale,
+        getTargetHeight(),
+        AUTO_OUTPUT_HEIGHT_CAP,
+    );
 
     Alpine.store('outputWidth', outputWidth);
     Alpine.store('outputHeight', outputHeight);
+    Alpine.store('currentScale', Number((outputHeight / video.videoHeight).toFixed(2)));
 }
 
 /**
@@ -428,8 +537,21 @@ function updateDownloadName(): void {
 }
 
 function getTargetHeight(): number | undefined {
+    if (!video?.videoHeight) return undefined;
+
     if (currentOutputResolution === 'source') {
-        return video?.videoHeight || undefined;
+        return video.videoHeight;
+    }
+
+    if (currentOutputResolution === 'auto') {
+        const modelInfo = getModelInfo(currentModel);
+        const nativeHeight = video.videoHeight * (modelInfo?.scale || 4);
+        // Auto never enlarges beyond the model's native scale and never
+        // downscales a source that is already taller than the hardware cap.
+        return Math.min(
+            nativeHeight,
+            Math.max(video.videoHeight, AUTO_OUTPUT_HEIGHT_CAP)
+        );
     }
 
     return getResolutionPreset(currentOutputResolution)?.maxHeight || undefined;
@@ -443,7 +565,7 @@ function getPreviewTargetHeight(): number | undefined {
         return Math.min(targetHeight || MAX_CLEANUP_PREVIEW_HEIGHT, MAX_CLEANUP_PREVIEW_HEIGHT);
     }
 
-    return targetHeight || MAX_AUTO_PREVIEW_HEIGHT;
+    return targetHeight;
 }
 
 function clearMediaObjectUrls(): void {
@@ -500,17 +622,19 @@ function replacePreviewCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
 //===================  Preview ===========================
 
 /**
- * Load video file from FileSystemFileHandle.
+ * Load a video from either File System Access or the regular file-input
+ * fallback.
  * Uses native Matroska/WebM support when available and lazily falls back to
  * FFmpeg remuxing only when the browser cannot decode the container.
  */
-async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
+async function loadVideo(source: FileSystemFileHandle | File): Promise<void> {
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Loading video...');
     clearMediaObjectUrls();
 
     // Get the file to check format and create preview
-    const file = await fileHandle.getFile();
+    const fileHandle = source instanceof File ? null : source;
+    const file = source instanceof File ? source : await source.getFile();
     const originalFilename = file.name;
 
     // Set up initial filename (use base name, will add extension based on output format)
@@ -525,7 +649,7 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
             // Keep the original handle so the worker can stream the source
             // without creating an intermediate MP4 or duplicating the file.
             inputFileHandle = fileHandle;
-            inputFile = null;
+            inputFile = fileHandle ? null : file;
         } else {
             Alpine.store('loading_message', 'Converting MKV to MP4...');
 
@@ -547,10 +671,10 @@ async function loadVideo(fileHandle: FileSystemFileHandle): Promise<void> {
             }
         }
     } else {
-        // MP4 and WebM inputs can stream directly to the worker. The worker's
-        // format list includes both ISO-BMFF and Matroska/WebM demuxers.
+        // MP4 and WebM inputs can stream from a file handle or remain backed by
+        // the File selected through the standard input fallback.
         inputFileHandle = fileHandle;
-        inputFile = null;
+        inputFile = fileHandle ? null : file;
     }
 
     updateDownloadName();
@@ -683,23 +807,7 @@ async function setupPreview(data: Blob): Promise<void> {
             }
         });
 
-        let bitrate = getBitrate();
-
-        const estimated_size = (bitrate / 8) * video.duration + (128 / 8) * video.duration; // Assume 128 kbps audio
-
-        if (estimated_size > 1900 * 1024 * 1024) {
-            Alpine.store('target', 'writer');
-        } else {
-            Alpine.store('target', 'blob');
-        }
-
-        const quota = (await navigator.storage.estimate()).quota;
-
-        if (estimated_size > quota!) {
-            return showError(`The video is too big. It would output a file of ${humanFileSize(estimated_size)} but the browser can only write files up to ${humanFileSize(quota!)}`);
-        }
-
-        Alpine.store('size', humanFileSize(estimated_size));
+        updateOutputEstimateAndTarget();
 
         function canvasFullScreen() {
             // Calculate aspect ratios
@@ -756,7 +864,7 @@ async function setupPreview(data: Blob): Promise<void> {
 worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
     if (event.data.cmd === 'isSupported') {
         const supported = event.data.data;
-        if (!supported) return showUnsupported("WebGPU");
+        if (!supported) return showUnsupported("ONNX Runtime WebAssembly");
 
     } else if (event.data.cmd === 'modelLoading') {
         const progress = event.data.data;
@@ -789,6 +897,9 @@ worker.onmessage = function (event: MessageEvent<WorkerResponseMessage>) {
         // Keep the latest averaged stage timings available for diagnostics
         // without updating the visible progress UI on every video frame.
         Alpine.store('timing', event.data.data);
+
+    } else if (event.data.cmd === 'pipeline') {
+        Alpine.store('pipeline', event.data.data);
 
     } else if (event.data.cmd === 'finished') {
         Alpine.store('state', 'complete');
@@ -825,18 +936,33 @@ async function initRecording(): Promise<void> {
     Alpine.store('state', 'loading');
     Alpine.store('loading_message', 'Preparing to process...');
 
-    let bitrate = getBitrate();
-    const estimated_size = (bitrate / 8) * video.duration + (128 / 8) * video.duration; // Assume 128 kbps audio
+    updateOutputDimensions();
+    const estimatedSize = estimateOutputSize();
+    updateOutputEstimateAndTarget(estimatedSize);
 
     let outputHandle: FileSystemFileHandle | undefined;
 
-    // Max Blob size - 10 MB (for testing, should be much higher in production)
-    if (estimated_size > 1900 * 1024 * 1024) {
+    if (shouldStreamOutput(estimatedSize)) {
+        if (typeof window.showSaveFilePicker !== 'function') {
+            showError(
+                'This output must be streamed to a file, but this browser does not support the save-file picker. '
+                + 'Choose a smaller output or use Chrome/Edge for large or unknown-duration jobs.'
+            );
+            return;
+        }
+
         try {
             outputHandle = await showFilePicker();
-        } catch (e) {
-            console.warn("User aborted request");
-            return Alpine.store('state', 'preview');
+        } catch (error) {
+            if (isAbortError(error)) {
+                console.log('Output selection cancelled');
+                Alpine.store('state', 'preview');
+                return;
+            }
+
+            console.error('Failed to choose output location:', error);
+            showError(`Failed to choose output location: ${errorMessage(error)}`);
+            return;
         }
     }
 
@@ -882,6 +1008,25 @@ function getBitrate(): number {
     return 5e6 * (outputWidth * outputHeight) / (1280 * 720);
 }
 
+function estimateOutputSize(): number | null {
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) {
+        return null;
+    }
+
+    return ((getBitrate() + AUDIO_BITRATE_BPS) / 8) * video.duration;
+}
+
+function shouldStreamOutput(estimatedSize: number | null): boolean {
+    // Unknown-duration inputs must use the bounded-memory streaming path.
+    return estimatedSize === null || estimatedSize > MAX_IN_MEMORY_OUTPUT_BYTES;
+}
+
+function updateOutputEstimateAndTarget(estimatedSize: number | null = estimateOutputSize()): void {
+    const streamOutput = shouldStreamOutput(estimatedSize);
+    Alpine.store('target', streamOutput ? 'writer' : 'blob');
+    Alpine.store('size', estimatedSize === null ? 'Unknown (streaming)' : humanFileSize(estimatedSize));
+}
+
 /**
  * Format bytes into human-readable file size.
  */
@@ -911,8 +1056,13 @@ function humanFileSize(bytes: number, si: boolean = false, dp: number = 1): stri
  */
 async function showFilePicker(): Promise<FileSystemFileHandle> {
     const formatInfo = getFormatInfo(currentOutputFormat);
+    const picker = window.showSaveFilePicker;
 
-    const handle = await window.showSaveFilePicker({
+    if (typeof picker !== 'function') {
+        throw new Error('The browser does not support streamed file output');
+    }
+
+    const handle = await picker.call(window, {
         startIn: 'downloads',
         suggestedName: download_name,
         types: [{

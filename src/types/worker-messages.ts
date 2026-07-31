@@ -10,8 +10,75 @@ export interface Resolution {
   height: number;
 }
 
+/**
+ * Round a display dimension to the next codec-friendly even integer. Rounding
+ * upward avoids silently dropping a source row/column for odd-sized videos.
+ */
+export function ceilToEven(value: number): number {
+  if (!Number.isFinite(value)) return 2;
+  const rounded = Math.max(2, Math.ceil(value));
+  return rounded % 2 === 0 ? rounded : rounded + 1;
+}
+
+/**
+ * Resolve the model's native output against a height cap and normalize the
+ * final encode/display dimensions in one shared place for main and worker.
+ */
+export function resolveOutputResolution(
+  source: Resolution,
+  scale: number,
+  targetHeight?: number,
+  defaultTargetHeight = 1080,
+): Resolution {
+  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const nativeWidth = source.width * safeScale;
+  const nativeHeight = source.height * safeScale;
+  const fallbackTarget = Math.max(source.height, defaultTargetHeight);
+  const resolvedTarget = typeof targetHeight === 'number'
+    && Number.isFinite(targetHeight)
+    && targetHeight > 0
+    ? targetHeight
+    : fallbackTarget;
+  const outputHeight = Math.min(nativeHeight, resolvedTarget);
+  const outputWidth = nativeHeight > 0
+    ? outputHeight * (nativeWidth / nativeHeight)
+    : nativeWidth;
+
+  return {
+    width: ceilToEven(outputWidth),
+    height: ceilToEven(outputHeight),
+  };
+}
+
+/**
+ * Resolve the source dimensions sent into a fixed-scale model. Inference
+ * surfaces do not need codec-even dimensions; rounding upward ensures the
+ * model output never undershoots the requested encode surface.
+ */
+export function resolveInferenceResolution(
+  source: Resolution,
+  scale: number,
+  encode: Resolution,
+): Resolution {
+  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const width = Math.max(1, Math.ceil(encode.width / safeScale));
+  const height = Math.max(1, Math.ceil(encode.height / safeScale));
+
+  if (width >= source.width && height >= source.height) {
+    return { width: source.width, height: source.height };
+  }
+
+  return {
+    width: Math.min(source.width, width),
+    height: Math.min(source.height, height),
+  };
+}
+
 export interface FrameTiming {
+  /** Decoder/demux iterator wait plus VideoSample -> VideoFrame conversion. */
   decodeMs: number;
+  decodeWaitMs: number;
+  frameConversionMs: number;
   audioMs: number;
   preprocessMs: number;
   inferenceMs: number;
@@ -20,6 +87,12 @@ export interface FrameTiming {
   gpuTimestampMs: number;
   canvasMs: number;
   encodeMs: number;
+  /** Output mux/target finalization time (populated by the final report). */
+  finalizeMs: number;
+  /** Frame-loop throughput through the latest encoded frame. */
+  wallFps: number;
+  /** Final pipeline throughput; zero until mux/target finalization completes. */
+  pipelineFps: number;
   totalMs: number;
   tileCount: number;
   inputPixels: number;
@@ -271,6 +344,7 @@ export type WorkerRequestMessage =
   | { cmd: 'isSupported' }
   | { cmd: 'init'; data: InitData }
   | { cmd: 'switchModel'; data: SwitchModelData }
+  | { cmd: 'renderPreview'; data: RenderPreviewData }
   | { cmd: 'cancel' }
   | { cmd: 'process'; inputHandle?: FileSystemFileHandle; inputFile?: File; outputHandle?: FileSystemFileHandle; settings: ProcessSettings };
 
@@ -289,10 +363,26 @@ export interface SwitchModelData {
   targetHeight?: number;
 }
 
+export interface RenderPreviewData {
+  bitmap: ImageBitmap;
+  targetHeight?: number;
+}
+
 export interface ProcessSettings {
   outputFormat: OutputFormat;
   outputResolution: OutputResolution;
   targetHeight?: number;
+}
+
+export interface PipelineTelemetry {
+  executionProvider: 'webgpu' | 'wasm';
+  renderPath:
+    | 'webgpu-direct'
+    | 'webgpu-2d-mirror'
+    | 'webgpu-2d-resize'
+    | 'cpu-tensor-direct-2d'
+    | 'cpu-tensor-2d-resize';
+  encoderConfig?: VideoEncoderConfig;
 }
 
 // Messages sent FROM worker TO main thread
@@ -303,6 +393,7 @@ export type WorkerResponseMessage =
   | { cmd: 'modelLoaded' }
   | { cmd: 'progress'; data: number }
   | { cmd: 'timing'; data: FrameTiming }
+  | { cmd: 'pipeline'; data: PipelineTelemetry }
   | { cmd: 'eta'; data: string }
   | { cmd: 'process' }
   | { cmd: 'cancelled' }

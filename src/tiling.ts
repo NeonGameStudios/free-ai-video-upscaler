@@ -16,6 +16,26 @@ export interface TilePlan {
   y: TileAxisPlan;
 }
 
+export interface TileCopyRegionInput {
+  /** Absolute output-canvas origin of the uncropped model output tile. */
+  tileOutputX: number;
+  tileOutputY: number;
+  /** Crop origin within the model output tile, in output pixels. */
+  cropX: number;
+  cropY: number;
+  width: number;
+  height: number;
+}
+
+export interface TileCopyRegion {
+  sourceX: number;
+  sourceY: number;
+  destinationX: number;
+  destinationY: number;
+  width: number;
+  height: number;
+}
+
 function planAxis(inputSize: number, maxTileSize: number, overlap: number): TileAxisPlan {
   if (inputSize <= maxTileSize) {
     return { count: 1, tileSize: inputSize, step: inputSize };
@@ -53,6 +73,26 @@ export function calculateTilePlan(
     overlap,
     x: planAxis(Math.max(1, Math.floor(inputWidth)), safeTileSize, overlap),
     y: planAxis(Math.max(1, Math.floor(inputHeight)), safeTileSize, overlap),
+  };
+}
+
+/**
+ * Place a cropped model-output tile on the output canvas.
+ *
+ * GPU texture copies place the crop's first pixel exactly at the destination
+ * origin. This differs from putImageData's dirty-rectangle overload, which
+ * implicitly offsets the destination by dirtyX/dirtyY. Keep this calculation
+ * shared and testable so the CPU and GPU compositors preserve identical global
+ * pixel coordinates.
+ */
+export function calculateTileCopyRegion(input: TileCopyRegionInput): TileCopyRegion {
+  return {
+    sourceX: input.cropX,
+    sourceY: input.cropY,
+    destinationX: input.tileOutputX + input.cropX,
+    destinationY: input.tileOutputY + input.cropY,
+    width: input.width,
+    height: input.height,
   };
 }
 

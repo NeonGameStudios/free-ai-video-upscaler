@@ -72,61 +72,132 @@ The dev server runs at `http://localhost:8080`. Open in Chrome/Safari to use Web
 - **Recommended**: Chrome/Edge with WebGPU support (best performance)
 - **Fallback**: Any modern browser with WebAssembly support. The app validates
   the selected ONNX execution provider and falls back to WASM when WebGPU or
-  a model graph is unsupported.
+  a model graph is unsupported. Browsers without File System Access use a
+  standard file input; large streamed outputs still require a save-file picker.
 
-## Performance checks
+## Performance behavior
 
-The renderer uses an adaptive, overlap-aware tile plan so edge tiles do not
-repeat a full maximum-size inference. It also reports averaged decode,
-preprocess, inference, postprocess, GPU queue-wait, GPU timestamp, canvas, and
-encode timings in the worker's diagnostic `timing` message.
+`Auto` chooses a conservative output-height cap from the hardware signals the
+browser exposes. It uses 1080p by default, 1440p with at least 4 GiB of reported
+memory and 4 logical processors, and 4K with at least 8 GiB and 8 processors.
+When memory is not reported, 8 processors select 1440p. Auto caps content at
+the model's native scale and does not downscale a source already above the cap;
+final codec dimensions are rounded upward to even values when necessary. A
+1080p input with a 4x model therefore no longer becomes an implicit 8K job. The
+active Auto cap is shown in the resolution control.
 
-```bash
-# Check the adaptive tile plan against representative frame sizes
-npm run benchmark:tiling
+Outputs estimated at 192 MiB or less use the convenient in-memory download
+path. Larger outputs, and inputs whose duration is unknown, ask for a save
+location before processing and stream muxed chunks directly to that file. MP4
+fast-start relocation is disabled so the in-memory convenience path does not
+also retain a second set of encoded packets until finalization. If the browser
+does not expose a save-file picker, select a smaller output or use Chrome/Edge
+for a streamed job.
 
-# Verify the AnimeJaNai PRelu graph rewrite used by the experimental WebGPU path
-npm run verify:onnx-rewrite
+On a validated WebGPU session, each source frame is uploaded once and tile
+preprocessing, inference, postprocessing, overlap composition, and presentation
+remain GPU-resident. Float32 and packed-float16 tensors, including fixed-shape
+and padded model inputs, use this path when ONNX Runtime accepts GPU-buffer
+interop. Input/output GPU buffers, ORT tensors, and bind groups are reused for
+every tile of the same shape. When inference already produces the requested
+encode size and the browser can snapshot a WebGPU canvas, the encoder consumes
+that canvas directly, avoiding the extra WebGPU-to-2D-canvas copy. Setup-time
+validation or interop failures fall back to the compatible CPU/WASM path. A
+runtime GPU failure after the encoder binds a direct canvas stops that job
+instead of changing encoder surfaces mid-stream.
 
-# Build a small browser WebGPU smoke benchmark, then serve dist/ on port 8080
-npm run benchmark:webgpu
-
-# Decode and upscale six frames from test-clips/BotsMaster-15sec.mp4
-npm run benchmark:clip
-
-# Build the repeatable two-clip encoding benchmark
-npm run benchmark:encoding
-```
-
-The browser benchmarks emit `gpu-benchmark.js`, `clip-regression.js`, and a
-content-hashed `encoding-benchmark.*.js`; load their corresponding temporary HTML pages from
-the development server. The encoding benchmark uses both repository clips and
-tests 480p, 720p, and 1080p target heights by default. Use query parameters to
-bound a run, for example:
-
-`encoding-benchmark.html?clip=short&targets=720,1080&frames=30`
-
-For tiled-path experiments, add `tileSize=256` (the default is 512 for 4x
-models); the selected tile size is reported with each case.
-
-Set `gpuTiming=1` (the default for the encoding benchmark) to include hardware
-timestamp-query measurements when the browser exposes the WebGPU feature.
-
-The encoding benchmark intentionally writes video-only MP4 output so audio
-passthrough does not obscure decode, upscale, and video-encoder comparisons.
-For reproducible local runs, the temporary benchmark bundle embeds the two
-repository clips; the production bundle does not include them.
-
-AnimeJaNai float16 WebGPU is deliberately experimental: the graph rewrite is
-validated structurally, but browsers/ONNX Runtime builds that cannot execute
-the rewritten graph automatically use the original model through WASM. The
-default float32 models use the GPU-buffer path when ONNX Runtime returns a
-GPU-resident output; any interop failure falls back to the existing CPU-tiled
-renderer for correctness.
+ONNX Runtime graph capture is deliberately disabled. In ORT 1.23.2 it requires
+GPU-only validation and immutable external buffer identities and shapes, while
+preview-to-job changes and adaptive/fixed-padding tile dimensions can rebuild
+buffers, and the recovery path must be able to bind CPU tensors. Persistent,
+preallocated GPU tensors remove per-tile allocation without those capture
+constraints.
 
 WebGPU initialization requests the high-performance adapter on macOS so a
 machine with multiple adapters does not select a low-power device for model
-inference.
+inference. Worker diagnostics report decoder-iterator wait, frame conversion,
+preprocess, inference, postprocess, GPU queue-wait, GPU timestamp, canvas,
+encode, finalization, and end-to-end wall FPS.
+
+## Performance checks
+
+```bash
+# Validate overlap cropping and destination placement for edge/interior tiles
+npm run verify:tile-placement
+
+# Validate codec-safe odd dimensions and inference sizing
+npm run verify:resolution
+
+# Compare adaptive tiling with the previous full-size edge-tile plan
+npm run benchmark:tiling
+
+# Build the repeatable browser encoding benchmark
+npm run benchmark:encoding
+
+# Or build and serve it directly on http://localhost:8080
+npm run benchmark:encoding:serve
+```
+
+The deterministic tiling benchmark currently reports the following reduction
+in model-input pixels versus the previous full-size edge-tile plan (measured
+July 31, 2026). These figures isolate inference work; they are not claimed as
+equivalent wall-clock speedups.
+
+| Input / max tile | Previous pixels | Adaptive pixels | Reduction |
+| --- | ---: | ---: | ---: |
+| 640×360 / 512 | 368,640 | 253,440 | 31.3% |
+| 1280×720 / 512 | 1,572,864 | 1,105,440 | 29.7% |
+| 1920×1080 / 512 | 3,932,160 | 2,635,620 | 33.0% |
+| 1920×1080 / 1024 | 4,194,304 | 2,269,696 | 45.9% |
+
+A local direct-canvas A/B on July 31, 2026 used Chrome 150.0.7871.49
+headless on arm64 macOS 26.5.2, the short bundled clip, RealESR AnimeVideo,
+960×540 output, a 256-pixel tile limit, disabled GPU timestamp queries, 5
+warmup frames, and 20 measured frames. The 540p output cap reduced inference to
+one 240×135 tile before the 4x model restored 960×540 output, so this isolates
+encoder-surface overhead rather than measuring a full 960×540-to-4K upscale.
+Each variant ran in a fresh Chrome process; both produced the same 184,410-byte
+output and pixel validation checksum.
+
+| Encode surface | Wall FPS | Mean frame time | FPS incl. finalize |
+| --- | ---: | ---: | ---: |
+| WebGPU → 2D mirror | 4.33 | 230.93 ms | 4.31 |
+| Direct WebGPU canvas | 4.44 | 225.38 ms | 4.42 |
+
+In that diagnostic, direct encoding improved measured wall throughput by
+2.5% and reduced mean frame time by 2.4%. Treat the figures as a reproducible
+local result rather than a universal browser/GPU guarantee; use `directGpu=0`
+to repeat the control on another machine. The 20-frame measurement windows
+were 4.619 seconds for the mirrored path and 4.508 seconds for the direct path;
+including five warmup frames plus source close/finalization took 5.798 and
+5.654 seconds respectively. Chrome startup, model initialization, output setup,
+and validation were outside that pipeline timer.
+
+A separate 1920×1080 WebGPU smoke used six tiles and the direct encoder path.
+All 35 border/interior/seam probes were opaque and non-black; nine seam pairs
+had a maximum adjacent-pixel RGB delta of 5. This checks placement and output
+integrity, not visual equivalence to a CPU reference implementation.
+
+With the benchmark server running, open a URL such as:
+
+`http://localhost:8080/encoding-benchmark.html?clip=short&targets=720,1080&frames=30&warmup=3&tileSize=256&gpuTiming=1&model=realesr-animevideov3`
+
+The encoding benchmark embeds the repository's `short` and `long` clips and
+tests 480p, 720p, and 1080p targets by default. Its query parameters are:
+
+- `clip=short|long` (omit it to run both clips)
+- `targets=480,720,1080` (comma-separated output heights)
+- `frames=30|all` (omit it or use `all` for the full clip)
+- `warmup=3` (measured frames exclude these warmup frames)
+- `tileSize=256` (minimum 32; defaults to 256 for 1x and 512 for scaled models)
+- `gpuTiming=0|1` (enabled by default when timestamp queries are available)
+- `directGpu=0|1` (disable the direct encoder canvas for an A/B comparison)
+- `model=realesr-animevideov3` (any model ID available to the app)
+
+The benchmark intentionally writes video-only MP4 output so audio passthrough
+does not obscure decode, upscale, and encoder comparisons. Other targeted
+checks remain available through `npm run verify:onnx-rewrite`,
+`npm run benchmark:webgpu`, and `npm run benchmark:clip`.
 
 ## Model Conversion
 
